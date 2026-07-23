@@ -15,6 +15,11 @@ struct PolarisRecord {
 }
 
 pub fn run(library: &Path, force: bool) -> Result<()> {
+    anyhow::ensure!(
+        cfg!(target_os = "macos"),
+        "import-polaris is only supported on macOS (Polaris is a macOS-only app)"
+    );
+
     let polaris_dir = find_polaris_dir()?;
     let db_path = polaris_dir.join("library.db");
     let docs_dir = polaris_dir.join("Documents");
