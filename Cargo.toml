@@ -18,6 +18,7 @@ reqwest = { version = "0.12", features = ["blocking"] }
 rusqlite = { version = "0.35", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_norway = "0.9"
 shellexpand = "3"
 slug = "0.1"
 tempfile = "3"

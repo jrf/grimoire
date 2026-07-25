@@ -1,4 +1,5 @@
 mod config;
+mod export;
 mod fetch;
 mod import_polaris;
 mod index;
@@ -40,6 +41,12 @@ enum Command {
         #[arg(short, long, default_value = "plain")]
         format: String,
     },
+    /// Export all references to stdout (yaml, json, bibtex, or hayagriva)
+    Export {
+        /// Output format: yaml, json, bibtex, hayagriva
+        #[arg(short, long)]
+        format: String,
+    },
     /// Rebuild the search index from filesystem
     Reindex,
     /// Import papers from a Polaris library
@@ -72,6 +79,7 @@ fn main() -> Result<()> {
         }
         Some(Command::Add { path }) => cmd_add(&library, &path),
         Some(Command::Cite { format }) => tui::cite(&config, &library, &format),
+        Some(Command::Export { format }) => export::run(&library, &format),
         Some(Command::Reindex) => cmd_reindex(&library),
         Some(Command::ImportPolaris { force }) => import_polaris::run(&library, force),
         Some(Command::Validate { fix }) => validate::run(&library, fix),

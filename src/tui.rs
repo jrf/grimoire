@@ -1082,28 +1082,7 @@ impl App {
             None => return Ok(()),
         };
         let r = &entry.reference;
-        let cite_key = &entry.dir_name;
-        let authors_bib = r.authors.join(" and ");
-
-        let mut bib = format!("@article{{{},\n", cite_key);
-        bib.push_str(&format!("  title = {{{}}},\n", r.title));
-        if !authors_bib.is_empty() {
-            bib.push_str(&format!("  author = {{{}}},\n", authors_bib));
-        }
-        if let Some(year) = r.year {
-            bib.push_str(&format!("  year = {{{}}},\n", year));
-        }
-        if let Some(ref journal) = r.journal {
-            bib.push_str(&format!("  journal = {{{}}},\n", journal));
-        }
-        if let Some(ref doi) = r.doi {
-            bib.push_str(&format!("  doi = {{{}}},\n", doi));
-        }
-        if let Some(ref arxiv) = r.arxiv {
-            bib.push_str(&format!("  eprint = {{{}}},\n", arxiv));
-            bib.push_str("  archiveprefix = {arXiv},\n");
-        }
-        bib.push('}');
+        let bib = crate::export::to_bibtex(&entry.dir_name, r);
 
         std::process::Command::new("pbcopy")
             .stdin(std::process::Stdio::piped())
