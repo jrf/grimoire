@@ -18,7 +18,8 @@
 
 ## Done
 
-- [x] `grimoire export` command: dump all references as yaml/json/bibtex/hayagriva to stdout #feature
+- [x] `grimoire export` command: yaml/json/bibtex/hayagriva, `--tag` filter, `-o` file output #feature
+- [x] Batch `add` (multiple inputs), `--version`, `completions <shell>` subcommand #feature
 - [x] TUI Refined Modal Coexistence: search fallback prompts and seamless Tab/Alt-A toggle between Search and Add modes #improvement
 - [x] `carina tag` command: `tag list`, `tag add`, `tag rm` #feature
 - [x] PDF full-text indexing into FTS5 on `reindex` and `add` #feature

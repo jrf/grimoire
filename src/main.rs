@@ -13,12 +13,12 @@ mod validate;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 
 use config::Config;
 
 #[derive(Parser)]
-#[command(name = "grimoire", about = "A fast TUI reference manager")]
+#[command(name = "grimoire", version, about = "A fast TUI reference manager")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -30,10 +30,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Import a PDF, DOI, arXiv ID, or URL into the library
+    /// Import one or more PDFs, DOIs, arXiv IDs, or URLs into the library
     Add {
-        /// Path to PDF file, DOI, arXiv ID, or URL
-        path: String,
+        /// Paths to PDF files, DOIs, arXiv IDs, or URLs
+        #[arg(required = true)]
+        paths: Vec<String>,
     },
     /// Pick a reference and output its citation key
     Cite {
@@ -41,11 +42,17 @@ enum Command {
         #[arg(short, long, default_value = "plain")]
         format: String,
     },
-    /// Export all references to stdout (yaml, json, bibtex, or hayagriva)
+    /// Export references (yaml, json, bibtex, or hayagriva) to stdout or a file
     Export {
         /// Output format: yaml, json, bibtex, hayagriva
         #[arg(short, long)]
         format: String,
+        /// Write to a file instead of stdout
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Only export references carrying this tag (repeatable; matches any)
+        #[arg(short, long)]
+        tag: Vec<String>,
     },
     /// Rebuild the search index from filesystem
     Reindex,
@@ -60,6 +67,11 @@ enum Command {
         /// Automatically fix issues (rename temp files, remove non-PDFs)
         #[arg(short, long)]
         fix: bool,
+    },
+    /// Generate a shell completion script (bash, zsh, fish, elvish, powershell)
+    Completions {
+        /// Shell to generate completions for
+        shell: clap_complete::Shell,
     },
 }
 
@@ -77,13 +89,39 @@ fn main() -> Result<()> {
             };
             tui::browse(&config, &library, initial.as_deref())
         }
-        Some(Command::Add { path }) => cmd_add(&library, &path),
+        Some(Command::Add { paths }) => cmd_add_many(&library, &paths),
         Some(Command::Cite { format }) => tui::cite(&config, &library, &format),
-        Some(Command::Export { format }) => export::run(&library, &format),
+        Some(Command::Export {
+            format,
+            output,
+            tag,
+        }) => export::run(&library, &format, output.as_deref(), &tag),
         Some(Command::Reindex) => cmd_reindex(&library),
         Some(Command::ImportPolaris { force }) => import_polaris::run(&library, force),
         Some(Command::Validate { fix }) => validate::run(&library, fix),
+        Some(Command::Completions { shell }) => {
+            let mut cmd = Cli::command();
+            let name = cmd.get_name().to_string();
+            clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
+            Ok(())
+        }
     }
+}
+
+/// Import several inputs in one invocation. A failure on one input is reported
+/// but does not abort the rest; the command exits non-zero if any failed.
+pub fn cmd_add_many(library: &Path, inputs: &[String]) -> Result<()> {
+    let mut failures = 0;
+    for input in inputs {
+        if let Err(e) = cmd_add(library, input) {
+            eprintln!("error: failed to add {input}: {e}");
+            failures += 1;
+        }
+    }
+    if failures > 0 {
+        anyhow::bail!("{failures} of {} input(s) failed", inputs.len());
+    }
+    Ok(())
 }
 
 pub fn cmd_add(library: &Path, input: &str) -> Result<()> {

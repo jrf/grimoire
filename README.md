@@ -26,12 +26,15 @@ grimoire jepa                     # browse with "jepa" pre-filled
 grimoire add 1706.03762           # import by arXiv ID (fetches metadata + PDF)
 grimoire add 10.1038/nature14539  # import by DOI (fetches metadata)
 grimoire add paper.pdf            # import local PDF
+grimoire add 1706.03762 2201.1234 # batch import (each input handled independently)
 grimoire cite --format typst      # pick a reference, output @cite-key
 grimoire export --format yaml     # dump all references to stdout as YAML
 grimoire export --format hayagriva # ...or json / bibtex / hayagriva (Typst)
+grimoire export -f bibtex --tag video -o refs.bib  # filter by tag, write to a file
 grimoire reindex                  # rebuild search index from filesystem
 grimoire validate                 # check library integrity
 grimoire validate --fix           # auto-fix issues (rename temp files, remove junk)
+grimoire completions fish         # emit a shell completion script
 ```
 
 ### TUI keybindings

@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Serialize;
 
 use crate::metadata;
@@ -17,7 +17,7 @@ struct ExportEntry {
     reference: Reference,
 }
 
-pub fn run(library: &Path, format: &str) -> Result<()> {
+pub fn run(library: &Path, format: &str, output: Option<&Path>, tags: &[String]) -> Result<()> {
     let dirs = storage::list_ref_dirs(library)?;
 
     let mut entries = Vec::new();
@@ -33,7 +33,12 @@ pub fn run(library: &Path, format: &str) -> Result<()> {
         }
     }
 
-    let output = match format.to_lowercase().as_str() {
+    // Keep only references carrying at least one of the requested tags.
+    if !tags.is_empty() {
+        entries.retain(|e| e.reference.tags.iter().any(|t| tags.contains(t)));
+    }
+
+    let rendered = match format.to_lowercase().as_str() {
         "yaml" | "yml" => serde_norway::to_string(&entries)?,
         "json" => serde_json::to_string_pretty(&entries)?,
         "bibtex" | "bib" => entries
@@ -53,7 +58,14 @@ pub fn run(library: &Path, format: &str) -> Result<()> {
         ),
     };
 
-    println!("{output}");
+    match output {
+        Some(path) => {
+            std::fs::write(path, format!("{rendered}\n"))
+                .with_context(|| format!("Failed to write {}", path.display()))?;
+            eprintln!("Exported {} reference(s) → {}", entries.len(), path.display());
+        }
+        None => println!("{rendered}"),
+    }
     Ok(())
 }
 
