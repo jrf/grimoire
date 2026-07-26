@@ -77,6 +77,8 @@ pub struct App {
     tag_popup: Option<TagPopup>,
     theme_popup: Option<ThemePopup>,
     layout: LayoutMode,
+    // In FullList layout, selecting a paper drills into a full-screen preview.
+    preview_overlay: bool,
     flash: Option<(String, std::time::Instant)>,
     preview_scroll: u16,
     show_help: bool,
@@ -244,11 +246,12 @@ impl ThemePopup {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 enum LayoutMode {
     Wide,
     Tall,
     Auto,
+    FullList,
 }
 
 impl LayoutMode {
@@ -256,7 +259,27 @@ impl LayoutMode {
         match s {
             Some("wide") => Self::Wide,
             Some("tall") => Self::Tall,
+            Some("list") => Self::FullList,
             _ => Self::Auto,
+        }
+    }
+
+    /// Cycle order for the runtime layout toggle (the `L` key).
+    fn next(self) -> Self {
+        match self {
+            Self::Wide => Self::Tall,
+            Self::Tall => Self::Auto,
+            Self::Auto => Self::FullList,
+            Self::FullList => Self::Wide,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Wide => "wide",
+            Self::Tall => "tall",
+            Self::Auto => "auto",
+            Self::FullList => "list",
         }
     }
 
@@ -264,6 +287,7 @@ impl LayoutMode {
         match self {
             Self::Wide => ResolvedLayout::Wide,
             Self::Tall => ResolvedLayout::Tall,
+            Self::FullList => ResolvedLayout::FullList,
             Self::Auto => {
                 // Character cells are ~2x taller than wide, so scale height
                 // to approximate pixel aspect ratio.
@@ -281,6 +305,8 @@ impl LayoutMode {
 enum ResolvedLayout {
     Wide,
     Tall,
+    FullList,
+    FullPreview,
 }
 
 enum Mode {
@@ -631,6 +657,10 @@ fn run_event_loop(terminal: &mut Term, app: &mut App, tty_ctl: &mut File) -> Res
                     _ => {}
                 },
                 InputMode::Browse => match (key.code, key.modifiers) {
+                    // Esc backs out of the full-screen preview before quitting.
+                    (KeyCode::Esc, _) if app.preview_overlay => {
+                        app.preview_overlay = false;
+                    }
                     (KeyCode::Esc, _) | (KeyCode::Char('q'), KeyModifiers::NONE) => {
                         app.should_quit = true;
                     }
@@ -665,6 +695,14 @@ fn run_event_loop(terminal: &mut Term, app: &mut App, tty_ctl: &mut File) -> Res
                     (KeyCode::Char('T'), KeyModifiers::SHIFT | KeyModifiers::NONE) => {
                         app.theme_popup = Some(ThemePopup::new());
                     }
+                    (KeyCode::Char('L'), KeyModifiers::SHIFT | KeyModifiers::NONE) => {
+                        app.preview_overlay = false;
+                        app.layout = app.layout.next();
+                        app.flash = Some((
+                            format!("Layout: {}", app.layout.label()),
+                            std::time::Instant::now(),
+                        ));
+                    }
                     (KeyCode::Char('c'), KeyModifiers::NONE) => {
                         app.filter.clear();
                         app.tag_filter = None;
@@ -673,6 +711,12 @@ fn run_event_loop(terminal: &mut Term, app: &mut App, tty_ctl: &mut File) -> Res
 
                     (KeyCode::Enter, _) => {
                         app.action_select()?;
+                    }
+                    // Space toggles the full-screen abstract in any layout
+                    // (Quick Look); esc or space again closes it.
+                    (KeyCode::Char(' '), _) => {
+                        app.preview_overlay = !app.preview_overlay;
+                        app.preview_scroll = 0;
                     }
                     (KeyCode::Char('e'), KeyModifiers::NONE) => {
                         app.action_edit(terminal, tty_ctl)?;
@@ -801,6 +845,7 @@ impl App {
             tag_popup: None,
             theme_popup: None,
             layout: LayoutMode::from_config(config.layout.as_deref()),
+            preview_overlay: false,
             flash: None,
             preview_scroll: 0,
             show_help: false,
@@ -1574,21 +1619,35 @@ fn draw(f: &mut Frame, app: &mut App) {
     let s_date = Style::default().fg(t.date);
 
     let area = f.area();
-    let resolved = app.layout.resolve(area.width, area.height);
+    // The full-screen preview overlay (drilled into from FullList) overrides
+    // whatever layout is otherwise in effect.
+    let resolved = if app.preview_overlay {
+        ResolvedLayout::FullPreview
+    } else {
+        app.layout.resolve(area.width, area.height)
+    };
 
     let border_style = Style::default().fg(t.border);
 
-    let (left_col, preview_area) = match resolved {
+    // `show_list` is false only in FullPreview, where the list pane is dropped
+    // but the search bar is kept so filtering still works.
+    let (left_col, preview_area, show_list) = match resolved {
         ResolvedLayout::Wide => {
             let chunks =
                 Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
                     .split(area);
-            (chunks[0], Some(chunks[1]))
+            (chunks[0], Some(chunks[1]), true)
         }
         ResolvedLayout::Tall => {
             let chunks = Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
                 .split(area);
-            (chunks[0], Some(chunks[1]))
+            (chunks[0], Some(chunks[1]), true)
+        }
+        ResolvedLayout::FullList => (area, None, true),
+        ResolvedLayout::FullPreview => {
+            // Search bar (3 rows) across the top, preview fills the rest.
+            let chunks = Layout::vertical([Constraint::Length(3), Constraint::Min(1)]).split(area);
+            (chunks[0], Some(chunks[1]), false)
         }
     };
 
@@ -1676,106 +1735,108 @@ fn draw(f: &mut Frame, app: &mut App) {
         Line::default()
     };
 
-    let list_block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(border_style)
-        .title(Line::from(Span::styled(" Papers ", s_hl)))
-        .title_bottom(bottom_left)
-        .title_bottom(sort_right.alignment(ratatui::layout::Alignment::Right));
+    if show_list {
+        let list_block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(border_style)
+            .title(Line::from(Span::styled(" Papers ", s_hl)))
+            .title_bottom(bottom_left)
+            .title_bottom(sort_right.alignment(ratatui::layout::Alignment::Right));
 
-    let list_inner = list_block.inner(list_area);
-    f.render_widget(list_block, list_area);
+        let list_inner = list_block.inner(list_area);
+        f.render_widget(list_block, list_area);
 
-    // Paper list — year + author + title
-    app.list_height = list_inner.height as usize;
-    let list_width = list_inner.width as usize;
-    let prefix_width = 3 + 6 + 14; // highlight_symbol + year + author
-    let title_max = list_width.saturating_sub(prefix_width);
+        // Paper list — year + author + title
+        app.list_height = list_inner.height as usize;
+        let list_width = list_inner.width as usize;
+        let prefix_width = 3 + 6 + 14; // highlight_symbol + year + author
+        let title_max = list_width.saturating_sub(prefix_width);
 
-    if app.filtered_indices.is_empty() {
-        let is_query_importable = is_importable(&app.filter);
-        let msg = if is_query_importable {
-            vec![
-                Line::from(Span::styled("No papers match this query.", s_dim)),
-                Line::from(""),
-                Line::from(Span::styled(
-                    "This query looks like an importable source!",
-                    s_hl.add_modifier(Modifier::BOLD),
-                )),
-                Line::from(""),
-                Line::from(vec![
-                    Span::styled("Press ", s_dim),
-                    Span::styled("Tab", s_hl.add_modifier(Modifier::BOLD)),
-                    Span::styled(" or ", s_dim),
-                    Span::styled("Ctrl-A", s_hl.add_modifier(Modifier::BOLD)),
-                    Span::styled(" to load it into the Add bar.", s_dim),
-                ]),
-            ]
+        if app.filtered_indices.is_empty() {
+            let is_query_importable = is_importable(&app.filter);
+            let msg = if is_query_importable {
+                vec![
+                    Line::from(Span::styled("No papers match this query.", s_dim)),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "This query looks like an importable source!",
+                        s_hl.add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(""),
+                    Line::from(vec![
+                        Span::styled("Press ", s_dim),
+                        Span::styled("Tab", s_hl.add_modifier(Modifier::BOLD)),
+                        Span::styled(" or ", s_dim),
+                        Span::styled("Ctrl-A", s_hl.add_modifier(Modifier::BOLD)),
+                        Span::styled(" to load it into the Add bar.", s_dim),
+                    ]),
+                ]
+            } else {
+                vec![Line::from(Span::styled(
+                    "No papers match this query.",
+                    s_dim,
+                ))]
+            };
+
+            let num_lines = msg.len();
+            let paragraph = Paragraph::new(msg)
+                .alignment(ratatui::layout::Alignment::Center)
+                .wrap(Wrap { trim: true });
+
+            // Center vertically inside list_inner
+            let vertical_margin = (list_inner.height as usize).saturating_sub(num_lines) / 2;
+            let hint_area = Layout::vertical([
+                Constraint::Length(vertical_margin as u16),
+                Constraint::Min(num_lines as u16),
+            ])
+            .split(list_inner)[1];
+
+            f.render_widget(paragraph, hint_area);
         } else {
-            vec![Line::from(Span::styled(
-                "No papers match this query.",
-                s_dim,
-            ))]
-        };
+            let items: Vec<ListItem> = app
+                .filtered_indices
+                .iter()
+                .map(|&idx| {
+                    let r = &app.entries[idx].reference;
 
-        let num_lines = msg.len();
-        let paragraph = Paragraph::new(msg)
-            .alignment(ratatui::layout::Alignment::Center)
-            .wrap(Wrap { trim: true });
+                    let year_str = r
+                        .year
+                        .map(|y| format!(" {} ", y))
+                        .unwrap_or_else(|| "      ".to_string());
 
-        // Center vertically inside list_inner
-        let vertical_margin = (list_inner.height as usize).saturating_sub(num_lines) / 2;
-        let hint_area = Layout::vertical([
-            Constraint::Length(vertical_margin as u16),
-            Constraint::Min(num_lines as u16),
-        ])
-        .split(list_inner)[1];
+                    let author_str = r
+                        .authors
+                        .first()
+                        .map(|a| {
+                            let last = if let Some((last, _)) = a.rsplit_once(',') {
+                                last.trim()
+                            } else {
+                                a.split_whitespace().last().unwrap_or(a)
+                            };
+                            format!("{:>12}  ", truncate_str(last, 12))
+                        })
+                        .unwrap_or_else(|| "              ".to_string());
 
-        f.render_widget(paragraph, hint_area);
-    } else {
-        let items: Vec<ListItem> = app
-            .filtered_indices
-            .iter()
-            .map(|&idx| {
-                let r = &app.entries[idx].reference;
+                    let title = truncate_ellipsis(&r.title, title_max);
 
-                let year_str = r
-                    .year
-                    .map(|y| format!(" {} ", y))
-                    .unwrap_or_else(|| "      ".to_string());
+                    ListItem::new(Line::from(vec![
+                        Span::styled(year_str, s_date),
+                        Span::styled(author_str, s_author),
+                        Span::styled(title, s_text),
+                    ]))
+                })
+                .collect();
 
-                let author_str = r
-                    .authors
-                    .first()
-                    .map(|a| {
-                        let last = if let Some((last, _)) = a.rsplit_once(',') {
-                            last.trim()
-                        } else {
-                            a.split_whitespace().last().unwrap_or(a)
-                        };
-                        format!("{:>12}  ", truncate_str(last, 12))
-                    })
-                    .unwrap_or_else(|| "              ".to_string());
+            let list = List::new(items)
+                .highlight_style(
+                    Style::default()
+                        .bg(t.selection)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .highlight_symbol(" > ");
 
-                let title = truncate_ellipsis(&r.title, title_max);
-
-                ListItem::new(Line::from(vec![
-                    Span::styled(year_str, s_date),
-                    Span::styled(author_str, s_author),
-                    Span::styled(title, s_text),
-                ]))
-            })
-            .collect();
-
-        let list = List::new(items)
-            .highlight_style(
-                Style::default()
-                    .bg(t.selection)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .highlight_symbol(" > ");
-
-        f.render_stateful_widget(list, list_inner, &mut app.list_state);
+            f.render_stateful_widget(list, list_inner, &mut app.list_state);
+        }
     }
 
     // Preview pane
@@ -2052,6 +2113,7 @@ fn draw(f: &mut Frame, app: &mut App) {
             ("J / K", "Scroll preview down / up"),
             ("/ or i", "Enter search mode"),
             ("enter", "Open PDF"),
+            ("space", "Toggle full-screen abstract"),
             ("e", "Edit info.toml"),
             ("y", "Copy BibTeX"),
             ("o", "Open DOI / arXiv in browser"),
@@ -2066,6 +2128,7 @@ fn draw(f: &mut Frame, app: &mut App) {
             ("c", "Clear search and tag filter"),
             ("t", "Browse tags"),
             ("T", "Switch theme"),
+            ("L", "Cycle layout (wide/tall/auto/list)"),
             ("q / esc", "Quit"),
             ("", ""),
             ("", "Search mode"),

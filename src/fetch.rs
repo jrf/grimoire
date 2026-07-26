@@ -13,7 +13,10 @@ fn clean_abstract(s: &str) -> String {
 }
 
 pub fn detect_arxiv_id(input: &str) -> Option<String> {
-    let re = Regex::new(r"^(?:(?:https?://)?(?:www\.)?arxiv\.org/(?:abs|pdf)/)?(\d{4}\.\d{4,5})(v\d+)?(?:\.pdf)?$").unwrap();
+    let re = Regex::new(
+        r"^(?:(?:https?://)?(?:www\.)?arxiv\.org/(?:abs|pdf)/)?(\d{4}\.\d{4,5})(v\d+)?(?:\.pdf)?$",
+    )
+    .unwrap();
     re.captures(input).map(|c| {
         let id = c.get(1).unwrap().as_str();
         match c.get(2) {

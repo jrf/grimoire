@@ -58,6 +58,8 @@ grimoire completions fish         # emit a shell completion script
 | `V` | Validate library (auto-fix) |
 | `t` | Browse tags |
 | `T` | Switch theme |
+| `space` | Toggle full-screen abstract (Quick Look) |
+| `L` | Cycle layout (wide/tall/auto/list) |
 | `?` | Help |
 | `q` | Quit |
 

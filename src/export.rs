@@ -62,7 +62,11 @@ pub fn run(library: &Path, format: &str, output: Option<&Path>, tags: &[String])
         Some(path) => {
             std::fs::write(path, format!("{rendered}\n"))
                 .with_context(|| format!("Failed to write {}", path.display()))?;
-            eprintln!("Exported {} reference(s) → {}", entries.len(), path.display());
+            eprintln!(
+                "Exported {} reference(s) → {}",
+                entries.len(),
+                path.display()
+            );
         }
         None => println!("{rendered}"),
     }
