@@ -246,7 +246,7 @@ impl ThemePopup {
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum LayoutMode {
     Wide,
     Tall,
@@ -259,8 +259,9 @@ impl LayoutMode {
         match s {
             Some("wide") => Self::Wide,
             Some("tall") => Self::Tall,
-            Some("list") => Self::FullList,
-            _ => Self::Auto,
+            Some("auto") => Self::Auto,
+            Some("full" | "list") | None => Self::FullList,
+            Some(_) => Self::FullList,
         }
     }
 
@@ -268,7 +269,7 @@ impl LayoutMode {
     fn next(self) -> Self {
         match self {
             Self::Wide => Self::Tall,
-            Self::Tall => Self::Auto,
+            Self::Tall => Self::FullList,
             Self::Auto => Self::FullList,
             Self::FullList => Self::Wide,
         }
@@ -279,7 +280,7 @@ impl LayoutMode {
             Self::Wide => "wide",
             Self::Tall => "tall",
             Self::Auto => "auto",
-            Self::FullList => "list",
+            Self::FullList => "full",
         }
     }
 
@@ -2128,7 +2129,7 @@ fn draw(f: &mut Frame, app: &mut App) {
             ("c", "Clear search and tag filter"),
             ("t", "Browse tags"),
             ("T", "Switch theme"),
-            ("L", "Cycle layout (wide/tall/auto/list)"),
+            ("L", "Cycle layout (full/wide/tall)"),
             ("q / esc", "Quit"),
             ("", ""),
             ("", "Search mode"),
@@ -2642,4 +2643,38 @@ fn draw_dedup(
             .wrap(Wrap { trim: false }),
         chunks[1],
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LayoutMode;
+
+    #[test]
+    fn layout_defaults_to_full() {
+        assert_eq!(LayoutMode::from_config(None), LayoutMode::FullList);
+        assert_eq!(
+            LayoutMode::from_config(Some("unknown")),
+            LayoutMode::FullList
+        );
+    }
+
+    #[test]
+    fn layout_config_accepts_full_and_legacy_list() {
+        assert_eq!(LayoutMode::from_config(Some("full")), LayoutMode::FullList);
+        assert_eq!(LayoutMode::from_config(Some("list")), LayoutMode::FullList);
+        assert_eq!(LayoutMode::from_config(Some("wide")), LayoutMode::Wide);
+        assert_eq!(LayoutMode::from_config(Some("tall")), LayoutMode::Tall);
+        assert_eq!(LayoutMode::from_config(Some("auto")), LayoutMode::Auto);
+    }
+
+    #[test]
+    fn layout_cycle_wraps_after_three_visible_modes() {
+        let full = LayoutMode::FullList;
+        let wide = full.next();
+        let tall = wide.next();
+
+        assert_eq!(wide, LayoutMode::Wide);
+        assert_eq!(tall, LayoutMode::Tall);
+        assert_eq!(tall.next(), full);
+    }
 }

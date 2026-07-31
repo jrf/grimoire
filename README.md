@@ -59,7 +59,7 @@ grimoire completions fish         # emit a shell completion script
 | `t` | Browse tags |
 | `T` | Switch theme |
 | `space` | Toggle full-screen abstract (Quick Look) |
-| `L` | Cycle layout (wide/tall/auto/list) |
+| `L` | Cycle layout (full/wide/tall) |
 | `?` | Help |
 | `q` | Quit |
 
@@ -102,6 +102,7 @@ library = "~/Papers"       # default
 editor = "hx"              # defaults to $EDITOR
 reader = "open"            # defaults to $GRIM_READER or "open"
 theme = "tokyo-night-moon" # default
+layout = "full"            # full (default), wide, tall, or auto
 ```
 
 Environment variables: `$GRIM_LIBRARY`, `$GRIM_READER`, `$EDITOR`.
