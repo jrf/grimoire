@@ -266,12 +266,18 @@ impl LayoutMode {
     }
 
     /// Cycle order for the runtime layout toggle (the `L` key).
-    fn next(self) -> Self {
-        match self {
+    fn next(self, width: u16, height: u16) -> Self {
+        let current = match self {
+            Self::Auto if width as u32 >= height as u32 * 2 => Self::Wide,
+            Self::Auto => Self::Tall,
+            concrete => concrete,
+        };
+
+        match current {
             Self::Wide => Self::Tall,
             Self::Tall => Self::FullList,
-            Self::Auto => Self::FullList,
             Self::FullList => Self::Wide,
+            Self::Auto => unreachable!(),
         }
     }
 
@@ -698,7 +704,8 @@ fn run_event_loop(terminal: &mut Term, app: &mut App, tty_ctl: &mut File) -> Res
                     }
                     (KeyCode::Char('L'), KeyModifiers::SHIFT | KeyModifiers::NONE) => {
                         app.preview_overlay = false;
-                        app.layout = app.layout.next();
+                        let size = terminal.size()?;
+                        app.layout = app.layout.next(size.width, size.height);
                         app.flash = Some((
                             format!("Layout: {}", app.layout.label()),
                             std::time::Instant::now(),
@@ -2670,11 +2677,17 @@ mod tests {
     #[test]
     fn layout_cycle_wraps_after_three_visible_modes() {
         let full = LayoutMode::FullList;
-        let wide = full.next();
-        let tall = wide.next();
+        let wide = full.next(120, 40);
+        let tall = wide.next(120, 40);
 
         assert_eq!(wide, LayoutMode::Wide);
         assert_eq!(tall, LayoutMode::Tall);
-        assert_eq!(tall.next(), full);
+        assert_eq!(tall.next(120, 40), full);
+    }
+
+    #[test]
+    fn auto_advances_from_its_resolved_layout() {
+        assert_eq!(LayoutMode::Auto.next(120, 40), LayoutMode::Tall);
+        assert_eq!(LayoutMode::Auto.next(80, 50), LayoutMode::FullList);
     }
 }

@@ -102,7 +102,7 @@ library = "~/Papers"       # default
 editor = "hx"              # defaults to $EDITOR
 reader = "open"            # defaults to $GRIM_READER or "open"
 theme = "tokyo-night-moon" # default
-layout = "full"            # full (default), wide, tall, or auto
+layout = "full"            # full (default), wide, tall, or auto; auto detects wide/tall
 ```
 
 Environment variables: `$GRIM_LIBRARY`, `$GRIM_READER`, `$EDITOR`.
