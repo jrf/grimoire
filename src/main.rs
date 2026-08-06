@@ -136,12 +136,19 @@ pub fn cmd_add(library: &Path, input: &str) -> Result<()> {
         return add_from_arxiv(library, &arxiv_id);
     }
 
-    if let Some(doi) = fetch::detect_doi(input) {
-        return add_from_doi(library, &doi);
+    if let Some(pmc_id) = fetch::detect_pmc_id(input) {
+        return add_from_pmc(library, &pmc_id);
     }
 
     if input.starts_with("http://") || input.starts_with("https://") {
+        if let Some(doi) = fetch::detect_doi_url(input) {
+            return add_from_doi(library, &doi);
+        }
         return add_from_url(library, input);
+    }
+
+    if let Some(doi) = fetch::detect_doi(input) {
+        return add_from_doi(library, &doi);
     }
 
     anyhow::bail!("Not a file, URL, arXiv ID, or DOI: {}", input)
@@ -197,6 +204,24 @@ fn add_from_doi(library: &Path, doi: &str) -> Result<()> {
     Ok(())
 }
 
+fn add_from_pmc(library: &Path, pmc_id: &str) -> Result<()> {
+    println!("Resolving PMC article and downloading PDF: {pmc_id}");
+    let (mut reference, bytes) = fetch::fetch_pmc(pmc_id)?;
+
+    let ref_dir = storage::create_ref_dir(library, &reference)?;
+    let pdf_filename = format!("{pmc_id}.pdf");
+    std::fs::write(ref_dir.join(&pdf_filename), bytes)
+        .with_context(|| format!("Failed to save PDF to {}", ref_dir.display()))?;
+
+    reference.files = vec![pdf_filename];
+    metadata::write_info(&ref_dir, &reference)?;
+    index_reference(library, &ref_dir, &reference);
+
+    println!("Added: {}", reference.title);
+    println!("  → {}", ref_dir.display());
+    Ok(())
+}
+
 fn add_from_file(library: &Path, path: &str) -> Result<()> {
     let path = PathBuf::from(path)
         .canonicalize()
@@ -238,40 +263,22 @@ fn add_from_file(library: &Path, path: &str) -> Result<()> {
 
 fn add_from_url(library: &Path, url: &str) -> Result<()> {
     println!("Downloading PDF from URL...");
-
-    let response =
-        reqwest::blocking::get(url).with_context(|| format!("Failed to download: {}", url))?;
-
-    let content_type = response
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-
-    if !content_type.contains("pdf") && !url.ends_with(".pdf") {
-        eprintln!(
-            "Warning: URL may not be a PDF (content-type: {})",
-            content_type
-        );
-    }
-
-    let filename = url
-        .rsplit('/')
-        .next()
-        .unwrap_or("download")
-        .split('?')
-        .next()
-        .unwrap_or("download");
-    let filename = if filename.ends_with(".pdf") {
-        filename.to_string()
-    } else {
-        format!("{}.pdf", filename)
-    };
+    let bytes = fetch::download_pdf(url)?;
+    let filename = reqwest::Url::parse(url)
+        .ok()
+        .and_then(|parsed| {
+            parsed
+                .path_segments()?
+                .rev()
+                .find(|segment| !segment.is_empty())
+                .map(str::to_string)
+        })
+        .filter(|name| name.to_ascii_lowercase().ends_with(".pdf"))
+        .unwrap_or_else(|| "download.pdf".to_string());
 
     let tmp_dir = tempfile::tempdir()?;
     let tmp_path = tmp_dir.path().join(&filename);
-    let bytes = response.bytes()?;
-    std::fs::write(&tmp_path, &bytes)?;
+    std::fs::write(&tmp_path, bytes)?;
 
     add_from_file(library, tmp_path.to_str().unwrap())
 }
