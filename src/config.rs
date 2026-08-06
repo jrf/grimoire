@@ -116,7 +116,7 @@ fn default_opener() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::ExternalCommand;
+    use super::{ExternalCommand, default_opener};
     use serde::Deserialize;
 
     #[derive(Deserialize)]
@@ -141,5 +141,14 @@ mod tests {
     fn external_command_rejects_empty_values() {
         assert!(ExternalCommand::Program(String::new()).build().is_err());
         assert!(ExternalCommand::Args(Vec::new()).build().is_err());
+    }
+
+    #[test]
+    fn default_opener_matches_the_platform() {
+        #[cfg(target_os = "macos")]
+        assert_eq!(default_opener(), "open");
+
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(default_opener(), "xdg-open");
     }
 }

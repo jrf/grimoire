@@ -18,6 +18,14 @@ Or with just:
 just install
 ```
 
+## Development
+
+Run the same formatting, compilation, lint, and test checks used by CI:
+
+```sh
+just check-all
+```
+
 ## Usage
 
 ```

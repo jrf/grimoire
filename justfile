@@ -16,6 +16,9 @@ check:
     cargo clippy
     cargo fmt --check
 
+check-all:
+    ./scripts/check-all
+
 fmt:
     cargo fmt
 
