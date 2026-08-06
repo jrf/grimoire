@@ -344,7 +344,7 @@ fn parse_crossref_response(json: &str) -> Result<Reference> {
         .and_then(|t| t.as_str())
         .map(|s| s.to_string());
 
-    let abstract_text = msg["abstract"].as_str().map(|s| clean_abstract(s));
+    let abstract_text = msg["abstract"].as_str().map(clean_abstract);
 
     Ok(Reference {
         title,
@@ -465,7 +465,22 @@ mod tests {
         detect_doi_url, detect_pmc_id, extract_pdf_from_oa_package, is_pdf_bytes,
         parse_crossref_pdf_url, parse_pmc_doi_response, parse_pmc_oa_package_url,
     };
-    use std::io::Write;
+
+    fn oa_package(path: &str, contents: &[u8]) -> Vec<u8> {
+        let mut compressed = Vec::new();
+        {
+            let encoder =
+                flate2::write::GzEncoder::new(&mut compressed, flate2::Compression::default());
+            let mut archive = tar::Builder::new(encoder);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(contents.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive.append_data(&mut header, path, contents).unwrap();
+            archive.into_inner().unwrap().finish().unwrap();
+        }
+        compressed
+    }
 
     #[test]
     fn detects_pmc_article_urls() {
@@ -530,25 +545,23 @@ mod tests {
 
     #[test]
     fn extracts_pdf_from_pmc_open_access_package() {
-        let mut compressed = Vec::new();
-        {
-            let encoder =
-                flate2::write::GzEncoder::new(&mut compressed, flate2::Compression::default());
-            let mut archive = tar::Builder::new(encoder);
-            let pdf = b"%PDF-1.7\nsynthetic";
-            let mut header = tar::Header::new_gnu();
-            header.set_size(pdf.len() as u64);
-            header.set_mode(0o644);
-            header.set_cksum();
-            archive
-                .append_data(&mut header, "synthetic/article.pdf", pdf.as_slice())
-                .unwrap();
-            archive.into_inner().unwrap().finish().unwrap();
-        }
+        let compressed = oa_package("synthetic/article.pdf", b"%PDF-1.7\nsynthetic");
 
         assert_eq!(
             extract_pdf_from_oa_package(&compressed).unwrap(),
             b"%PDF-1.7\nsynthetic"
+        );
+    }
+
+    #[test]
+    fn rejects_non_pdf_content_in_pmc_open_access_package() {
+        let compressed = oa_package("synthetic/article.pdf", b"<html>synthetic</html>");
+
+        assert_eq!(
+            extract_pdf_from_oa_package(&compressed)
+                .unwrap_err()
+                .to_string(),
+            "PMC package entry is not a PDF"
         );
     }
 }

@@ -753,11 +753,9 @@ fn run_event_loop(terminal: &mut Term, app: &mut App, tty_ctl: &mut File) -> Res
                     (KeyCode::Char('V'), KeyModifiers::SHIFT | KeyModifiers::NONE) => {
                         app.action_validate();
                     }
-                    (KeyCode::Char('s'), KeyModifiers::NONE) => {
-                        if app.filter.is_empty() {
-                            app.sort_mode = app.sort_mode.next();
-                            app.rebuild_filter();
-                        }
+                    (KeyCode::Char('s'), KeyModifiers::NONE) if app.filter.is_empty() => {
+                        app.sort_mode = app.sort_mode.next();
+                        app.rebuild_filter();
                     }
 
                     (KeyCode::Char('J'), KeyModifiers::SHIFT | KeyModifiers::NONE) => {
@@ -1721,8 +1719,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     f.render_widget(Paragraph::new(search_content), search_inner);
 
     // Cursor position for input
-    if app.add_input.is_some() {
-        let add_text = app.add_input.as_ref().unwrap();
+    if let Some(add_text) = &app.add_input {
         let cursor_x = search_inner.x + add_text.len() as u16;
         f.set_cursor_position((cursor_x, search_inner.y));
     } else if app.input_mode == InputMode::Search {
