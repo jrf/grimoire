@@ -1066,9 +1066,17 @@ impl App {
                 };
                 match pdf {
                     Some(p) => {
-                        std::process::Command::new(self.config.reader())
-                            .arg(&p)
-                            .spawn()?;
+                        match spawn_detached(
+                            std::process::Command::new(self.config.reader()).arg(&p),
+                        ) {
+                            Ok(_) => {}
+                            Err(e) => {
+                                self.flash = Some((
+                                    format!("Failed to open PDF: {}", e),
+                                    std::time::Instant::now(),
+                                ));
+                            }
+                        }
                     }
                     None => {
                         self.flash =
@@ -1137,18 +1145,14 @@ impl App {
         let r = &entry.reference;
         let bib = crate::export::to_bibtex(&entry.dir_name, r);
 
-        std::process::Command::new("pbcopy")
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-            .and_then(|mut child| {
-                use std::io::Write;
-                if let Some(mut stdin) = child.stdin.take() {
-                    let _ = stdin.write_all(bib.as_bytes());
-                }
-                child.wait()
-            })?;
-
-        self.flash = Some(("Copied BibTeX".to_string(), std::time::Instant::now()));
+        match copy_to_clipboard(&bib) {
+            Ok(()) => {
+                self.flash = Some(("Copied BibTeX".to_string(), std::time::Instant::now()));
+            }
+            Err(e) => {
+                self.flash = Some((format!("Copy failed: {}", e), std::time::Instant::now()));
+            }
+        }
         Ok(())
     }
 
@@ -1294,11 +1298,27 @@ impl App {
             self.flash = Some(("No DOI or arXiv ID".to_string(), std::time::Instant::now()));
             return;
         };
-        let _ = std::process::Command::new("open").arg(&url).spawn();
-        self.flash = Some(("Opened in browser".to_string(), std::time::Instant::now()));
+        match spawn_detached(std::process::Command::new(self.config.reader()).arg(&url)) {
+            Ok(_) => {
+                self.flash = Some(("Opened in browser".to_string(), std::time::Instant::now()));
+            }
+            Err(e) => {
+                self.flash = Some((
+                    format!("Failed to open browser: {}", e),
+                    std::time::Instant::now(),
+                ));
+            }
+        }
     }
 
     fn action_open_polaris(&mut self) {
+        if !cfg!(target_os = "macos") {
+            self.flash = Some((
+                "Polaris is only available on macOS".to_string(),
+                std::time::Instant::now(),
+            ));
+            return;
+        }
         let entry = match self.selected_entry() {
             Some(e) => e,
             None => return,
@@ -1320,12 +1340,12 @@ impl App {
                 }
             }
         };
-        match std::process::Command::new("open")
-            .arg("-a")
-            .arg("Polaris")
-            .arg(&pdf)
-            .spawn()
-        {
+        match spawn_detached(
+            std::process::Command::new("open")
+                .arg("-a")
+                .arg("Polaris")
+                .arg(&pdf),
+        ) {
             Ok(_) => {
                 self.flash = Some(("Opened in Polaris".to_string(), std::time::Instant::now()))
             }
@@ -1486,6 +1506,60 @@ impl App {
         self.entries[idx].reference = r;
         self.entries[idx].display = display;
     }
+}
+
+fn spawn_detached(cmd: &mut std::process::Command) -> std::io::Result<std::process::Child> {
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+}
+
+fn copy_to_clipboard(text: &str) -> Result<()> {
+    use std::io::Write;
+
+    let candidates: &[(&str, &[&str])] = if cfg!(target_os = "macos") {
+        &[("pbcopy", &[])]
+    } else {
+        &[
+            ("wl-copy", &[]),
+            ("xclip", &["-selection", "clipboard"]),
+            ("xsel", &["--clipboard", "--input"]),
+        ]
+    };
+
+    let mut last_error = None;
+    for (bin, args) in candidates {
+        match std::process::Command::new(bin)
+            .args(*args)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+        {
+            Ok(mut child) => {
+                if let Some(mut stdin) = child.stdin.take()
+                    && let Err(error) = stdin.write_all(text.as_bytes())
+                {
+                    last_error = Some(error.into());
+                    let _ = child.wait();
+                    continue;
+                }
+                match child.wait() {
+                    Ok(status) if status.success() => return Ok(()),
+                    Ok(status) => {
+                        last_error = Some(anyhow::anyhow!("{bin} exited with {status}"));
+                    }
+                    Err(error) => last_error = Some(error.into()),
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => last_error = Some(e.into()),
+        }
+    }
+
+    if let Some(error) = last_error {
+        return Err(error);
+    }
+    anyhow::bail!("no clipboard utility found (install wl-clipboard, xclip, or xsel)")
 }
 
 fn compute_diffs(old: &Reference, new: &Reference) -> Vec<(String, String, String)> {

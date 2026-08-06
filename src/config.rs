@@ -53,7 +53,7 @@ impl Config {
         std::env::var("GRIM_READER")
             .ok()
             .or_else(|| self.reader.clone())
-            .unwrap_or_else(|| "open".to_string())
+            .unwrap_or_else(default_reader)
     }
 
     fn config_path() -> PathBuf {
@@ -61,5 +61,13 @@ impl Config {
             .unwrap_or_else(|| PathBuf::from("."))
             .join("grimoire")
             .join("config.toml")
+    }
+}
+
+fn default_reader() -> String {
+    if cfg!(target_os = "macos") {
+        "open".to_string()
+    } else {
+        "xdg-open".to_string()
     }
 }
