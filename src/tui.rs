@@ -1510,20 +1510,9 @@ impl App {
 
 fn spawn_detached(cmd: &mut std::process::Command) -> std::io::Result<std::process::Child> {
     cmd.stdin(std::process::Stdio::null())
-        .stdout(log_stdio())
-        .stderr(log_stdio())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .spawn()
-}
-
-fn log_stdio() -> std::process::Stdio {
-    match std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(std::env::temp_dir().join("grimoire.log"))
-    {
-        Ok(f) => std::process::Stdio::from(f),
-        Err(_) => std::process::Stdio::null(),
-    }
 }
 
 fn copy_to_clipboard(text: &str) -> Result<()> {
@@ -1539,6 +1528,7 @@ fn copy_to_clipboard(text: &str) -> Result<()> {
         ]
     };
 
+    let mut last_error = None;
     for (bin, args) in candidates {
         match std::process::Command::new(bin)
             .args(*args)
@@ -1546,17 +1536,29 @@ fn copy_to_clipboard(text: &str) -> Result<()> {
             .spawn()
         {
             Ok(mut child) => {
-                if let Some(mut stdin) = child.stdin.take() {
-                    stdin.write_all(text.as_bytes())?;
+                if let Some(mut stdin) = child.stdin.take()
+                    && let Err(error) = stdin.write_all(text.as_bytes())
+                {
+                    last_error = Some(error.into());
+                    let _ = child.wait();
+                    continue;
                 }
-                child.wait()?;
-                return Ok(());
+                match child.wait() {
+                    Ok(status) if status.success() => return Ok(()),
+                    Ok(status) => {
+                        last_error = Some(anyhow::anyhow!("{bin} exited with {status}"));
+                    }
+                    Err(error) => last_error = Some(error.into()),
+                }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(e.into()),
+            Err(e) => last_error = Some(e.into()),
         }
     }
 
+    if let Some(error) = last_error {
+        return Err(error);
+    }
     anyhow::bail!("no clipboard utility found (install wl-clipboard, xclip, or xsel)")
 }
 
