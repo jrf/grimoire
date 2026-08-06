@@ -39,7 +39,6 @@
 - [x] Open: `carina open` with `$CARINA_READER` or `open` fallback, `--reader` flag #feature
 - [x] Edit: `carina edit` opens `info.toml` in `$EDITOR` #feature
 - [x] BibTeX export: `carina bib <query>` #feature
-- [x] Import from Polaris: `carina import-polaris` with `--force` flag #feature
 - [x] SQLite FTS5 index: schema, indexing, `carina reindex` #feature
 - [x] Picker-agnostic: configurable via `$CARINA_PICKER` or config.toml #improvement
 - [x] Shell completions: `carina completions {fish,bash,zsh}` #chore

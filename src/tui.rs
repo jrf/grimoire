@@ -735,9 +735,6 @@ fn run_event_loop(terminal: &mut Term, app: &mut App, tty_ctl: &mut File) -> Res
                     (KeyCode::Char('o'), KeyModifiers::NONE) => {
                         app.action_open_url();
                     }
-                    (KeyCode::Char('p'), KeyModifiers::NONE) => {
-                        app.action_open_polaris();
-                    }
                     (KeyCode::Char('a'), KeyModifiers::NONE) => {
                         app.add_input = Some(String::new());
                     }
@@ -836,13 +833,7 @@ impl App {
             filtered_indices,
             filter,
             list_state: ListState::default(),
-            config: AppConfig {
-                library: config.library.clone(),
-                editor: config.editor.clone(),
-                reader: config.reader.clone(),
-                theme: config.theme.clone(),
-                layout: config.layout.clone(),
-            },
+            config: config.clone(),
             theme,
             mode,
             input_mode: InputMode::Browse,
@@ -1065,19 +1056,15 @@ impl App {
                         .map(|e| e.path())
                 };
                 match pdf {
-                    Some(p) => {
-                        match spawn_detached(
-                            std::process::Command::new(self.config.reader()).arg(&p),
-                        ) {
-                            Ok(_) => {}
-                            Err(e) => {
-                                self.flash = Some((
-                                    format!("Failed to open PDF: {}", e),
-                                    std::time::Instant::now(),
-                                ));
-                            }
+                    Some(p) => match launch_detached(self.config.reader_command(), &p) {
+                        Ok(_) => {}
+                        Err(e) => {
+                            self.flash = Some((
+                                format!("Failed to open PDF: {}", e),
+                                std::time::Instant::now(),
+                            ));
                         }
-                    }
+                    },
                     None => {
                         self.flash =
                             Some(("No PDF available".to_string(), std::time::Instant::now()));
@@ -1104,17 +1091,17 @@ impl App {
             None => return Ok(()),
         };
         let info_path = entry.dir.join("info.toml");
+        let mut editor = self.config.editor_command()?;
 
         terminal::disable_raw_mode()?;
         tty_ctl.execute(LeaveAlternateScreen)?;
 
-        std::process::Command::new(self.config.editor())
-            .arg(&info_path)
-            .status()?;
+        let status = editor.arg(&info_path).status();
 
         tty_ctl.execute(EnterAlternateScreen)?;
         terminal::enable_raw_mode()?;
         terminal.clear()?;
+        status?;
 
         let idx = self.filtered_indices[self.list_state.selected().unwrap_or(0)];
         if let Ok(r) = metadata::read_info(&self.entries[idx].dir) {
@@ -1298,7 +1285,7 @@ impl App {
             self.flash = Some(("No DOI or arXiv ID".to_string(), std::time::Instant::now()));
             return;
         };
-        match spawn_detached(std::process::Command::new(self.config.reader()).arg(&url)) {
+        match launch_detached(self.config.browser_command(), &url) {
             Ok(_) => {
                 self.flash = Some(("Opened in browser".to_string(), std::time::Instant::now()));
             }
@@ -1308,48 +1295,6 @@ impl App {
                     std::time::Instant::now(),
                 ));
             }
-        }
-    }
-
-    fn action_open_polaris(&mut self) {
-        if !cfg!(target_os = "macos") {
-            self.flash = Some((
-                "Polaris is only available on macOS".to_string(),
-                std::time::Instant::now(),
-            ));
-            return;
-        }
-        let entry = match self.selected_entry() {
-            Some(e) => e,
-            None => return,
-        };
-        let pdf = if let Some(f) = entry.reference.files.first() {
-            entry.dir.join(f)
-        } else {
-            match std::fs::read_dir(&entry.dir).ok().and_then(|rd| {
-                rd.flatten().find(|e| {
-                    e.path()
-                        .extension()
-                        .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"))
-                })
-            }) {
-                Some(e) => e.path(),
-                None => {
-                    self.flash = Some(("No PDF found".to_string(), std::time::Instant::now()));
-                    return;
-                }
-            }
-        };
-        match spawn_detached(
-            std::process::Command::new("open")
-                .arg("-a")
-                .arg("Polaris")
-                .arg(&pdf),
-        ) {
-            Ok(_) => {
-                self.flash = Some(("Opened in Polaris".to_string(), std::time::Instant::now()))
-            }
-            Err(e) => self.flash = Some((format!("Error: {}", e), std::time::Instant::now())),
         }
     }
 
@@ -1513,6 +1458,15 @@ fn spawn_detached(cmd: &mut std::process::Command) -> std::io::Result<std::proce
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
+}
+
+fn launch_detached<T: AsRef<std::ffi::OsStr>>(
+    command: Result<std::process::Command>,
+    target: T,
+) -> Result<std::process::Child> {
+    let mut command = command?;
+    command.arg(target);
+    Ok(spawn_detached(&mut command)?)
 }
 
 fn copy_to_clipboard(text: &str) -> Result<()> {
@@ -2199,7 +2153,6 @@ fn draw(f: &mut Frame, app: &mut App) {
             ("e", "Edit info.toml"),
             ("y", "Copy BibTeX"),
             ("o", "Open DOI / arXiv in browser"),
-            ("p", "Open PDF in Polaris"),
             ("a", "Add paper (path, DOI, arXiv, URL)"),
             ("r", "Enrich selected (fetch metadata)"),
             ("R", "Enrich all with missing fields"),

@@ -1,13 +1,41 @@
 use std::path::PathBuf;
+use std::process::Command;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Deserialize;
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+pub enum ExternalCommand {
+    Program(String),
+    Args(Vec<String>),
+}
+
+impl ExternalCommand {
+    fn build(&self) -> Result<Command> {
+        let (program, args) = match self {
+            Self::Program(program) => (program.as_str(), &[][..]),
+            Self::Args(parts) => {
+                let (program, args) = parts
+                    .split_first()
+                    .context("External command cannot be empty")?;
+                (program.as_str(), args)
+            }
+        };
+        anyhow::ensure!(!program.is_empty(), "External command cannot be empty");
+
+        let mut command = Command::new(program);
+        command.args(args);
+        Ok(command)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
 pub struct Config {
     pub library: Option<String>,
-    pub editor: Option<String>,
-    pub reader: Option<String>,
+    pub editor: Option<ExternalCommand>,
+    pub reader: Option<ExternalCommand>,
+    pub browser: Option<ExternalCommand>,
     pub theme: Option<String>,
     pub layout: Option<String>,
 }
@@ -23,6 +51,7 @@ impl Config {
                 library: None,
                 editor: None,
                 reader: None,
+                browser: None,
                 theme: None,
                 layout: None,
             })
@@ -42,18 +71,31 @@ impl Config {
             .join("Papers")
     }
 
-    pub fn editor(&self) -> String {
-        std::env::var("EDITOR")
-            .ok()
-            .or_else(|| self.editor.clone())
-            .unwrap_or_else(|| "vi".to_string())
+    pub fn editor_command(&self) -> Result<Command> {
+        self.command("EDITOR", self.editor.as_ref(), "vi")
     }
 
-    pub fn reader(&self) -> String {
-        std::env::var("GRIM_READER")
-            .ok()
-            .or_else(|| self.reader.clone())
-            .unwrap_or_else(default_reader)
+    pub fn reader_command(&self) -> Result<Command> {
+        self.command("GRIM_READER", self.reader.as_ref(), default_opener())
+    }
+
+    pub fn browser_command(&self) -> Result<Command> {
+        self.command("BROWSER", self.browser.as_ref(), default_opener())
+    }
+
+    fn command(
+        &self,
+        environment_variable: &str,
+        configured: Option<&ExternalCommand>,
+        default: &str,
+    ) -> Result<Command> {
+        if let Ok(program) = std::env::var(environment_variable) {
+            return ExternalCommand::Program(program).build();
+        }
+        configured
+            .cloned()
+            .unwrap_or_else(|| ExternalCommand::Program(default.to_string()))
+            .build()
     }
 
     fn config_path() -> PathBuf {
@@ -64,10 +106,40 @@ impl Config {
     }
 }
 
-fn default_reader() -> String {
+fn default_opener() -> &'static str {
     if cfg!(target_os = "macos") {
-        "open".to_string()
+        "open"
     } else {
-        "xdg-open".to_string()
+        "xdg-open"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ExternalCommand;
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    struct TestConfig {
+        command: ExternalCommand,
+    }
+
+    #[test]
+    fn external_command_accepts_program_or_argument_list() {
+        let program: TestConfig = toml::from_str("command = \"open\"").unwrap();
+        let command = program.command.build().unwrap();
+        assert_eq!(command.get_program(), "open");
+        assert_eq!(command.get_args().count(), 0);
+
+        let args: TestConfig = toml::from_str("command = [\"open\", \"-a\", \"Preview\"]").unwrap();
+        let command = args.command.build().unwrap();
+        assert_eq!(command.get_program(), "open");
+        assert_eq!(command.get_args().collect::<Vec<_>>(), ["-a", "Preview"]);
+    }
+
+    #[test]
+    fn external_command_rejects_empty_values() {
+        assert!(ExternalCommand::Program(String::new()).build().is_err());
+        assert!(ExternalCommand::Args(Vec::new()).build().is_err());
     }
 }
