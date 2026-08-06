@@ -1,7 +1,6 @@
 mod config;
 mod export;
 mod fetch;
-mod import_polaris;
 mod index;
 mod metadata;
 mod model;
@@ -56,12 +55,6 @@ enum Command {
     },
     /// Rebuild the search index from filesystem
     Reindex,
-    /// Import papers from a Polaris library
-    ImportPolaris {
-        /// Overwrite metadata for existing entries
-        #[arg(short, long)]
-        force: bool,
-    },
     /// Validate library integrity (missing PDFs, junk files, temp names)
     Validate {
         /// Automatically fix issues (rename temp files, remove non-PDFs)
@@ -97,7 +90,6 @@ fn main() -> Result<()> {
             tag,
         }) => export::run(&library, &format, output.as_deref(), &tag),
         Some(Command::Reindex) => cmd_reindex(&library),
-        Some(Command::ImportPolaris { force }) => import_polaris::run(&library, force),
         Some(Command::Validate { fix }) => validate::run(&library, fix),
         Some(Command::Completions { shell }) => {
             let mut cmd = Cli::command();

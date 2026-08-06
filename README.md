@@ -48,7 +48,6 @@ grimoire completions fish         # emit a shell completion script
 | `e` | Edit info.toml |
 | `y` | Copy BibTeX |
 | `o` | Open DOI / arXiv in browser |
-| `p` | Open PDF in Polaris |
 | `a` | Add paper (path, DOI, arXiv ID, URL) |
 | `r` | Enrich selected (fetch metadata) |
 | `R` | Enrich all with missing fields |
@@ -99,13 +98,17 @@ Optional. Grimoire works without any config file.
 
 ```toml
 library = "~/Papers"       # default
-editor = "hx"              # defaults to $EDITOR
-reader = "open"            # defaults to $GRIM_READER or "open"
+editor = ["hx"]             # string or command plus arguments; defaults to $EDITOR or "vi"
+reader = ["open"]           # PDF opener; defaults to $GRIM_READER or the OS opener
+browser = ["open"]          # URL opener; defaults to $BROWSER or the OS opener
 theme = "tokyo-night-moon" # default
 layout = "full"            # full (default), wide, tall, or auto; auto detects wide/tall
 ```
 
-Environment variables: `$GRIM_LIBRARY`, `$GRIM_READER`, `$EDITOR`.
+Command values accept either a string (`reader = "zathura"`) or an argument array
+(`reader = ["open", "-a", "Preview"]`). Grimoire appends the file path or URL.
+
+Environment variables: `$GRIM_LIBRARY`, `$GRIM_READER`, `$BROWSER`, `$EDITOR`.
 
 ## Helix integration
 
