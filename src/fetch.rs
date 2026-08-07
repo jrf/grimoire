@@ -21,11 +21,26 @@ fn http_client() -> Result<reqwest::blocking::Client> {
 }
 
 fn clean_abstract(s: &str) -> String {
+    // Replace tags with a space (not nothing) so JATS section boundaries like
+    // </jats:title><jats:p> don't glue a heading onto the body
+    // ("...Background</jats:title><jats:p>Measurements..." would otherwise
+    // become "BackgroundMeasurements"). Whitespace is collapsed below.
     let tag_re = Regex::new(r"<[^>]+>").unwrap();
-    let s = tag_re.replace_all(s, "");
-    let s = Regex::new(r"(?i)^\s*abstract[.:]\s*")
+    let s = tag_re.replace_all(s, " ");
+    // Drop a leading "Abstract" heading when followed by punctuation/space.
+    let s = Regex::new(r"(?i)^\s*abstract\s*[.:]\s*")
         .unwrap()
         .replace(&s, "");
+    // Also drop it when the heading runs straight into a capitalized first word
+    // (with or without a space), as happens when a JATS
+    // <jats:title>Abstract</jats:title> is flattened ("AbstractPolyps..." or
+    // "Abstract Background..." -> the body). Case-sensitive on "Abstract" and
+    // requiring a following capital so real words ("Abstraction", "Abstract is
+    // a concept") are left alone. (The regex crate has no look-ahead, so the
+    // remainder is kept via a capture group.)
+    let s = Regex::new(r"(?s)^\s*Abstract\s*([A-Z].*)$")
+        .unwrap()
+        .replace(&s, "$1");
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
@@ -627,10 +642,50 @@ fn resolve_relative(base: &str, link: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        detect_doi_in_url, detect_doi_url, detect_pmc_id, detect_pmid, extract_pdf_from_oa_package,
-        is_pdf_bytes, meta_content, parse_crossref_pdf_url, parse_csl_item, parse_pmc_doi_response,
-        parse_pmc_oa_package_url,
+        clean_abstract, detect_doi_in_url, detect_doi_url, detect_pmc_id, detect_pmid,
+        extract_pdf_from_oa_package, is_pdf_bytes, meta_content, parse_crossref_pdf_url,
+        parse_csl_item, parse_pmc_doi_response, parse_pmc_oa_package_url,
     };
+
+    #[test]
+    fn strips_leading_abstract_heading() {
+        // Glued straight onto a capitalized word (flattened JATS heading).
+        assert_eq!(
+            clean_abstract("AbstractPolyps in the colon are precursors."),
+            "Polyps in the colon are precursors."
+        );
+        // With punctuation.
+        assert_eq!(clean_abstract("Abstract: Hello world"), "Hello world");
+        assert_eq!(clean_abstract("ABSTRACT. Hello world"), "Hello world");
+        // Heading followed by a space then a capitalized section word.
+        assert_eq!(
+            clean_abstract("Abstract Background Assessment of X"),
+            "Background Assessment of X"
+        );
+        // Tags stripped, whitespace collapsed.
+        assert_eq!(
+            clean_abstract("<jats:p>Hello   world</jats:p>"),
+            "Hello world"
+        );
+        // Structured JATS: section boundaries de-glue and the Abstract heading
+        // is dropped ("...Background</title><p>Measurements..." must not glue).
+        assert_eq!(
+            clean_abstract(
+                "<jats:title>Abstract</jats:title><jats:sec>\
+                 <jats:title>Background</jats:title><jats:p>Measurements obtained.</jats:p></jats:sec>"
+            ),
+            "Background Measurements obtained."
+        );
+        // Real words beginning with "Abstract" are left intact.
+        assert_eq!(
+            clean_abstract("Abstraction is a key idea."),
+            "Abstraction is a key idea."
+        );
+        assert_eq!(
+            clean_abstract("Abstracts were collected."),
+            "Abstracts were collected."
+        );
+    }
 
     #[test]
     fn extracts_doi_embedded_in_a_url() {
