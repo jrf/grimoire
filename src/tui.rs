@@ -77,7 +77,7 @@ pub struct App {
     tag_popup: Option<TagPopup>,
     theme_popup: Option<ThemePopup>,
     layout: LayoutMode,
-    // In FullList layout, selecting a paper drills into a full-screen preview.
+    // Space toggles a full-screen abstract preview over any layout (Quick Look).
     preview_overlay: bool,
     flash: Option<(String, std::time::Instant)>,
     preview_scroll: u16,
@@ -97,10 +97,10 @@ struct ValidatePopup {
 }
 
 type FieldDiff = (String, String, String); // (field, old, new)
-type EnrichItem = (usize, Reference, Vec<FieldDiff>); // (entry idx, updated ref, diffs)
+type EnrichItem = (PathBuf, Reference, Vec<FieldDiff>); // (entry dir, updated ref, diffs)
 
 struct EnrichPreview {
-    idx: usize,
+    dir: PathBuf,
     updated: Reference,
     diffs: Vec<FieldDiff>,
     scroll: u16,
@@ -406,10 +406,10 @@ fn run_event_loop(terminal: &mut Term, app: &mut App, tty_ctl: &mut File) -> Res
                             Some(("Nothing to enrich".to_string(), std::time::Instant::now()));
                     } else {
                         let mut queue = items;
-                        let (idx, updated, diffs) = queue.remove(0);
-                        app.jump_to_entry(idx);
+                        let (dir, updated, diffs) = queue.remove(0);
+                        app.jump_to_entry(&dir);
                         app.enrich_preview = Some(EnrichPreview {
-                            idx,
+                            dir,
                             updated,
                             diffs,
                             scroll: 0,
@@ -746,6 +746,9 @@ fn run_event_loop(terminal: &mut Term, app: &mut App, tty_ctl: &mut File) -> Res
                     }
                     (KeyCode::Char('d'), KeyModifiers::NONE) => {
                         run_dedup(terminal, app)?;
+                        // Dedup moves directories on disk; refresh the in-memory
+                        // list so removed entries stop showing in the browser.
+                        app.reload_entries();
                     }
                     (KeyCode::Char('I'), KeyModifiers::SHIFT | KeyModifiers::NONE) => {
                         app.action_reindex();
@@ -1099,7 +1102,13 @@ impl App {
         tty_ctl.execute(EnterAlternateScreen)?;
         terminal::enable_raw_mode()?;
         terminal.clear()?;
-        status?;
+
+        // A failure to launch the editor (e.g. a mis-configured $EDITOR) must
+        // not tear down the whole TUI — report it and stay in the session.
+        if let Err(e) = status {
+            self.flash = Some((format!("Editor failed: {e}"), std::time::Instant::now()));
+            return Ok(());
+        }
 
         let idx = self.filtered_indices[self.list_state.selected().unwrap_or(0)];
         if let Ok(r) = metadata::read_info(&self.entries[idx].dir) {
@@ -1171,9 +1180,13 @@ impl App {
         match output {
             Ok(o) if o.status.success() => {
                 let stdout = String::from_utf8_lossy(&o.stdout);
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                // A successful run with no "Added:" line and a duplicate notice
+                // means the import was skipped as a duplicate.
                 let msg = stdout
                     .lines()
                     .find(|l| l.starts_with("Added:"))
+                    .or_else(|| stderr.lines().find(|l| l.contains("duplicate of")))
                     .unwrap_or("Added successfully")
                     .to_string();
                 self.flash = Some((msg, std::time::Instant::now()));
@@ -1319,7 +1332,7 @@ impl App {
                     if diffs.is_empty() {
                         vec![]
                     } else {
-                        vec![(idx, updated, diffs)]
+                        vec![(dir, updated, diffs)]
                     }
                 }
                 _ => vec![],
@@ -1333,12 +1346,11 @@ impl App {
             return;
         }
 
-        let work: Vec<(usize, PathBuf, Reference)> = self
+        let work: Vec<(PathBuf, Reference)> = self
             .entries
             .iter()
-            .enumerate()
-            .filter(|(_, e)| needs_enrich(&e.reference))
-            .map(|(i, e)| (i, e.dir.clone(), e.reference.clone()))
+            .filter(|e| needs_enrich(&e.reference))
+            .map(|e| (e.dir.clone(), e.reference.clone()))
             .collect();
 
         if work.is_empty() {
@@ -1355,11 +1367,11 @@ impl App {
 
         std::thread::spawn(move || {
             let mut items: Vec<EnrichItem> = Vec::new();
-            for (idx, dir, reference) in work {
+            for (dir, reference) in work {
                 if let Ok(Some(updated)) = enrich_entry(&dir, &reference) {
                     let diffs = compute_diffs(&reference, &updated);
                     if !diffs.is_empty() {
-                        items.push((idx, updated, diffs));
+                        items.push((dir, updated, diffs));
                     }
                 }
             }
@@ -1373,9 +1385,14 @@ impl App {
             None => return,
         };
         let library = self.config.library_dir();
-        let _ = metadata::write_info(&self.entries[ep.idx].dir, &ep.updated);
-        crate::index_reference(&library, &self.entries[ep.idx].dir, &ep.updated);
-        self.update_entry_display(ep.idx, ep.updated);
+        // Write to disk by directory path (stable), independent of the entry's
+        // current position in the list — which may have shifted while the
+        // background fetch was in flight.
+        let _ = metadata::write_info(&ep.dir, &ep.updated);
+        crate::index_reference(&library, &ep.dir, &ep.updated);
+        if let Some(idx) = self.entries.iter().position(|e| e.dir == ep.dir) {
+            self.update_entry_display(idx, ep.updated);
+        }
         let applied = ep.applied + 1;
         self.advance_enrich_queue(ep.batch_queue, applied, ep.skipped);
     }
@@ -1412,10 +1429,10 @@ impl App {
             self.flash = Some((msg, std::time::Instant::now()));
             return;
         }
-        let (idx, updated, diffs) = queue.remove(0);
-        self.jump_to_entry(idx);
+        let (dir, updated, diffs) = queue.remove(0);
+        self.jump_to_entry(&dir);
         self.enrich_preview = Some(EnrichPreview {
-            idx,
+            dir,
             updated,
             diffs,
             scroll: 0,
@@ -1425,7 +1442,10 @@ impl App {
         });
     }
 
-    fn jump_to_entry(&mut self, entry_idx: usize) {
+    fn jump_to_entry(&mut self, dir: &Path) {
+        let Some(entry_idx) = self.entries.iter().position(|e| e.dir.as_path() == dir) else {
+            return;
+        };
         if let Some(pos) = self.filtered_indices.iter().position(|&i| i == entry_idx) {
             self.list_state.select(Some(pos));
             self.preview_scroll = 0;
@@ -1678,17 +1698,25 @@ fn draw(f: &mut Frame, app: &mut App) {
             (chunks[0], Some(chunks[1]), true)
         }
         ResolvedLayout::FullList => (area, None, true),
-        ResolvedLayout::FullPreview => {
-            // Search bar (3 rows) across the top, preview fills the rest.
-            let chunks = Layout::vertical([Constraint::Length(3), Constraint::Min(1)]).split(area);
-            (chunks[0], Some(chunks[1]), false)
-        }
+        // The overlay spans the whole area; the search bar and preview are
+        // carved out by the shared split below so the search bar keeps the
+        // exact same 3-row height as every list layout.
+        ResolvedLayout::FullPreview => (area, None, false),
     };
 
     // Split left column: search bar (3 rows) + list
     let left_parts = Layout::vertical([Constraint::Length(3), Constraint::Min(1)]).split(left_col);
     let search_area = left_parts[0];
     let list_area = left_parts[1];
+
+    // In the full-screen preview overlay there is no list, so the region below
+    // the search bar becomes the preview pane. Deriving it here (rather than in
+    // the match) keeps the search bar's height identical to the list layouts.
+    let preview_area = if resolved == ResolvedLayout::FullPreview {
+        Some(list_area)
+    } else {
+        preview_area
+    };
 
     // Search / add bar
     let search_content = if let Some(ref add_text) = app.add_input {
@@ -1730,26 +1758,42 @@ fn draw(f: &mut Frame, app: &mut App) {
 
     // Status bar as bottom title of list
     let count_str = format!(" {}/{} ", app.filtered_indices.len(), app.entries.len());
-    let mode_indicator = match app.input_mode {
-        InputMode::Browse => Span::styled(
-            " BROWSE ",
+    let mode_indicator = if app.add_input.is_some() {
+        // Add mode is orthogonal to Browse/Search (it's a text-entry overlay),
+        // so it gets its own indicator with a distinct accent.
+        Span::styled(
+            " ADD ",
             Style::default()
                 .fg(t.status_fg)
-                .bg(t.normal_bg)
+                .bg(t.highlight)
                 .add_modifier(Modifier::BOLD),
-        ),
-        InputMode::Search => Span::styled(
-            " SEARCH ",
-            Style::default()
-                .fg(t.status_fg)
-                .bg(t.insert_bg)
-                .add_modifier(Modifier::BOLD),
-        ),
+        )
+    } else {
+        match app.input_mode {
+            InputMode::Browse => Span::styled(
+                " BROWSE ",
+                Style::default()
+                    .fg(t.status_fg)
+                    .bg(t.normal_bg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            InputMode::Search => Span::styled(
+                " SEARCH ",
+                Style::default()
+                    .fg(t.status_fg)
+                    .bg(t.insert_bg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        }
     };
-    let mode_hint = match (app.input_mode, &app.mode) {
-        (InputMode::Search, _) => " esc browse ",
-        (InputMode::Browse, Mode::Browse) => " / search  c clear  q quit ",
-        (InputMode::Browse, Mode::Cite { .. }) => " / search  c clear  q quit ",
+    let mode_hint = if app.add_input.is_some() {
+        " enter add  esc cancel "
+    } else {
+        match (app.input_mode, &app.mode) {
+            (InputMode::Search, _) => " esc browse ",
+            (InputMode::Browse, Mode::Browse) => " / search  c clear  q quit ",
+            (InputMode::Browse, Mode::Cite { .. }) => " / search  c clear  q quit ",
+        }
     };
     let mut bottom_spans = vec![mode_indicator, Span::styled(count_str, s_muted)];
     if let Some(flash) = app.flash_message() {
@@ -2037,7 +2081,7 @@ fn draw(f: &mut Frame, app: &mut App) {
 
     // Enrich preview popup
     if let Some(ref ep) = app.enrich_preview {
-        let title_text = truncate_ellipsis(&app.entries[ep.idx].reference.title, 40);
+        let title_text = truncate_ellipsis(&ep.updated.title, 40);
         let batch_info = if !ep.batch_queue.is_empty() || ep.applied > 0 || ep.skipped > 0 {
             let remaining = ep.batch_queue.len() + 1;
             let total = ep.applied + ep.skipped + remaining;
@@ -2372,7 +2416,10 @@ fn run_dedup(terminal: &mut Term, app: &mut App) -> Result<()> {
                         std::fs::create_dir_all(&trash_dir)?;
                         for (i, entry) in entries.iter().enumerate() {
                             if i != selected {
-                                let dest = trash_dir.join(&entry.dir_name);
+                                // Uniquify: a same-named dir may already sit in
+                                // .trash from a previous dedup, and renaming onto
+                                // an existing directory fails with ENOTEMPTY.
+                                let dest = unique_trash_path(&trash_dir, &entry.dir_name);
                                 std::fs::rename(&entry.path, &dest)?;
                                 removed += 1;
                             }
@@ -2393,6 +2440,18 @@ fn run_dedup(terminal: &mut Term, app: &mut App) -> Result<()> {
     app.flash = Some((msg, std::time::Instant::now()));
     terminal.clear()?;
     Ok(())
+}
+
+/// Pick a destination under `.trash` that doesn't already exist, suffixing
+/// `-1`, `-2`, ... on collision so moving a duplicate never fails with ENOTEMPTY.
+fn unique_trash_path(trash_dir: &Path, name: &str) -> PathBuf {
+    let mut dest = trash_dir.join(name);
+    let mut n = 1;
+    while dest.exists() {
+        dest = trash_dir.join(format!("{name}-{n}"));
+        n += 1;
+    }
+    dest
 }
 
 struct DedupEntry {
@@ -2474,69 +2533,83 @@ fn metadata_score_ref(r: &Reference) -> u32 {
     score
 }
 
+// Union-find: any two references sharing a normalized title OR a normalized
+// DOI belong to the same duplicate group. Merging both keys into one component
+// (rather than grouping by title then DOI separately) means a paper linked to a
+// group by DOI is caught even when its title differs, and vice versa.
+fn uf_find(parent: &mut [usize], mut x: usize) -> usize {
+    while parent[x] != x {
+        parent[x] = parent[parent[x]];
+        x = parent[x];
+    }
+    x
+}
+
+fn uf_union(parent: &mut [usize], a: usize, b: usize) {
+    let ra = uf_find(parent, a);
+    let rb = uf_find(parent, b);
+    if ra != rb {
+        parent[ra] = rb;
+    }
+}
+
 fn find_duplicate_groups(library: &Path) -> Result<Vec<Vec<PathBuf>>> {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
 
     let dirs = storage::list_ref_dirs(library)?;
-    let mut by_title: HashMap<String, Vec<PathBuf>> = HashMap::new();
-    let mut by_doi: HashMap<String, Vec<PathBuf>> = HashMap::new();
+    let mut parent: Vec<usize> = (0..dirs.len()).collect();
 
-    for dir in &dirs {
+    // First directory seen for each normalized title / DOI; subsequent matches
+    // union into it. Directories whose info.toml fails to parse are simply
+    // never keyed, so they stay singletons and drop out below.
+    let mut first_by_title: HashMap<String, usize> = HashMap::new();
+    let mut first_by_doi: HashMap<String, usize> = HashMap::new();
+
+    for (i, dir) in dirs.iter().enumerate() {
         let r = match metadata::read_info(dir) {
             Ok(r) => r,
             Err(_) => continue,
         };
 
-        let normalized_title = r.title.trim().to_lowercase();
-        if !normalized_title.is_empty() {
-            by_title
-                .entry(normalized_title)
-                .or_default()
-                .push(dir.clone());
+        let title = r.title.trim().to_lowercase();
+        if !title.is_empty() {
+            match first_by_title.get(&title) {
+                Some(&j) => uf_union(&mut parent, i, j),
+                None => {
+                    first_by_title.insert(title, i);
+                }
+            }
         }
 
         if let Some(ref doi) = r.doi {
-            let normalized_doi = doi.trim().to_lowercase();
-            if !normalized_doi.is_empty() {
-                by_doi.entry(normalized_doi).or_default().push(dir.clone());
-            }
-        }
-    }
-
-    let mut seen: HashSet<PathBuf> = HashSet::new();
-    let mut groups: Vec<Vec<PathBuf>> = Vec::new();
-
-    for paths in by_title.values() {
-        if paths.len() > 1 {
-            let group: Vec<_> = paths
-                .iter()
-                .filter(|p| !seen.contains(*p))
-                .cloned()
-                .collect();
-            if group.len() > 1 {
-                for p in &group {
-                    seen.insert(p.clone());
+            let doi = doi.trim().to_lowercase();
+            if !doi.is_empty() {
+                match first_by_doi.get(&doi) {
+                    Some(&j) => uf_union(&mut parent, i, j),
+                    None => {
+                        first_by_doi.insert(doi, i);
+                    }
                 }
-                groups.push(group);
             }
         }
     }
 
-    for paths in by_doi.values() {
-        if paths.len() > 1 {
-            let group: Vec<_> = paths
-                .iter()
-                .filter(|p| !seen.contains(*p))
-                .cloned()
-                .collect();
-            if group.len() > 1 {
-                for p in &group {
-                    seen.insert(p.clone());
-                }
-                groups.push(group);
-            }
-        }
+    // Gather connected components, keeping only those with more than one member.
+    let mut by_root: HashMap<usize, Vec<PathBuf>> = HashMap::new();
+    for (i, dir) in dirs.iter().enumerate() {
+        let root = uf_find(&mut parent, i);
+        by_root.entry(root).or_default().push(dir.clone());
     }
+
+    let mut groups: Vec<Vec<PathBuf>> = by_root
+        .into_values()
+        .filter(|group| group.len() > 1)
+        .collect();
+    // Deterministic ordering for a stable dedup walkthrough.
+    for group in &mut groups {
+        group.sort();
+    }
+    groups.sort();
 
     Ok(groups)
 }

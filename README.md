@@ -35,6 +35,7 @@ grimoire add 1706.03762           # import by arXiv ID (fetches metadata + PDF)
 grimoire add 10.1038/nature14539  # import by DOI (fetches metadata)
 grimoire add paper.pdf            # import local PDF
 grimoire add 1706.03762 2201.1234 # batch import (each input handled independently)
+grimoire add --force 1706.03762   # import even if a matching DOI/title already exists
 grimoire cite --format typst      # pick a reference, output @cite-key
 grimoire export --format yaml     # dump all references to stdout as YAML
 grimoire export --format hayagriva # ...or json / bibtex / hayagriva (Typst)
@@ -116,7 +117,9 @@ layout = "full"            # full (default), wide, tall, or auto; auto detects w
 Command values accept either a string (`reader = "zathura"`) or an argument array
 (`reader = ["open", "-a", "Preview"]`). Grimoire appends the file path or URL.
 
-Environment variables: `$GRIM_LIBRARY`, `$GRIM_READER`, `$BROWSER`, `$EDITOR`.
+Environment variables: `$GRIM_LIBRARY`, `$GRIM_READER`, `$GRIM_EDITOR` (or
+`$EDITOR`), `$GRIM_BROWSER` (or `$BROWSER`). The `GRIM_`-prefixed names take
+precedence.
 
 ## Helix integration
 
@@ -138,6 +141,22 @@ l = [":insert-output grimoire cite --format latex", ":redraw"]
 - **arXiv ID** (`1706.03762`) — fetches metadata from arXiv API, downloads PDF
 - **arXiv URL** (`https://arxiv.org/abs/1706.03762`) — same
 - **PMC URL** (`https://pmc.ncbi.nlm.nih.gov/articles/PMC1234567/`) — resolves metadata and downloads an available publisher or PMC Open Access PDF
-- **DOI** (`10.1038/nature14539`) — fetches metadata from CrossRef
+- **PubMed URL / PMID** (`https://pubmed.ncbi.nlm.nih.gov/26017442/`, `PMID:26017442`) — resolves the DOI via NCBI, then fetches metadata from CrossRef
+- **DOI** (`10.1038/nature14539`) — fetches metadata from CrossRef; if no PDF is otherwise available, tries Unpaywall for an open-access copy
+- **DOI or doi.org URL** — a DOI embedded anywhere in a URL (e.g. a PLoS `?id=10.1371/…` link) is extracted automatically
+- **Publisher landing page** (`https://www.nature.com/articles/…`, ScienceDirect, Springer, etc.) — scrapes the page's `citation_doi` / `citation_pdf_url` meta tags to resolve metadata and, when the PDF is openly available, download it
 - **Direct PDF URL** — downloads only when the response contains PDF data
 - **Local PDF** (`paper.pdf`) — extracts metadata from PDF; if filename looks like an arXiv ID, fetches metadata from arXiv
+
+> **Prefer the DOI for publisher pages.** Some sites can't be imported from
+> their article URL: JavaScript-rendered pages (e.g. IEEE Xplore) expose no DOI
+> or PDF link in the HTML we fetch, and bot-protected pages (e.g. MDPI behind
+> Cloudflare) refuse the request outright. No tool that doesn't run a full
+> browser can scrape these. Add them by **DOI** instead — metadata always
+> resolves via CrossRef, and an open-access PDF is fetched via Unpaywall when a
+> reachable copy exists.
+
+If an incoming reference matches an existing entry by DOI or normalized title,
+`add` warns and skips it; pass `--force` to import anyway. The interactive
+deduplicator (`d` in the TUI) groups existing references that share a title
+**or** DOI so you can merge them after the fact.

@@ -34,6 +34,9 @@ enum Command {
         /// Paths to PDF files, DOIs, arXiv IDs, or URLs
         #[arg(required = true)]
         paths: Vec<String>,
+        /// Import even if an entry with the same DOI or title already exists
+        #[arg(short, long)]
+        force: bool,
     },
     /// Pick a reference and output its citation key
     Cite {
@@ -82,7 +85,7 @@ fn main() -> Result<()> {
             };
             tui::browse(&config, &library, initial.as_deref())
         }
-        Some(Command::Add { paths }) => cmd_add_many(&library, &paths),
+        Some(Command::Add { paths, force }) => cmd_add_many(&library, &paths, force),
         Some(Command::Cite { format }) => tui::cite(&config, &library, &format),
         Some(Command::Export {
             format,
@@ -102,10 +105,10 @@ fn main() -> Result<()> {
 
 /// Import several inputs in one invocation. A failure on one input is reported
 /// but does not abort the rest; the command exits non-zero if any failed.
-pub fn cmd_add_many(library: &Path, inputs: &[String]) -> Result<()> {
+pub fn cmd_add_many(library: &Path, inputs: &[String], force: bool) -> Result<()> {
     let mut failures = 0;
     for input in inputs {
-        if let Err(e) = cmd_add(library, input) {
+        if let Err(e) = cmd_add(library, input, force) {
             eprintln!("error: failed to add {input}: {e}");
             failures += 1;
         }
@@ -116,34 +119,87 @@ pub fn cmd_add_many(library: &Path, inputs: &[String]) -> Result<()> {
     Ok(())
 }
 
-pub fn cmd_add(library: &Path, input: &str) -> Result<()> {
+pub fn cmd_add(library: &Path, input: &str, force: bool) -> Result<()> {
     std::fs::create_dir_all(library)?;
 
     let path = PathBuf::from(input);
     if path.exists() {
-        return add_from_file(library, input);
+        return add_from_file(library, input, force);
     }
 
     if let Some(arxiv_id) = fetch::detect_arxiv_id(input) {
-        return add_from_arxiv(library, &arxiv_id);
+        return add_from_arxiv(library, &arxiv_id, force);
     }
 
     if let Some(pmc_id) = fetch::detect_pmc_id(input) {
-        return add_from_pmc(library, &pmc_id);
+        return add_from_pmc(library, &pmc_id, force);
+    }
+
+    if let Some(pmid) = fetch::detect_pmid(input) {
+        return add_from_pubmed(library, &pmid, force);
     }
 
     if input.starts_with("http://") || input.starts_with("https://") {
         if let Some(doi) = fetch::detect_doi_url(input) {
-            return add_from_doi(library, &doi);
+            return add_from_doi(library, &doi, force);
         }
-        return add_from_url(library, input);
+        return add_from_web_url(library, input, force);
     }
 
     if let Some(doi) = fetch::detect_doi(input) {
-        return add_from_doi(library, &doi);
+        return add_from_doi(library, &doi, force);
     }
 
     anyhow::bail!("Not a file, URL, arXiv ID, or DOI: {}", input)
+}
+
+/// Import from an arbitrary web URL that isn't a recognized arXiv/PMC/doi.org
+/// link: try a DOI embedded in the URL, then the landing page's citation meta
+/// tags, and finally fall back to treating the URL as a direct PDF.
+fn add_from_web_url(library: &Path, url: &str, force: bool) -> Result<()> {
+    if let Some(doi) = fetch::detect_doi_in_url(url) {
+        return add_from_doi(library, &doi, force);
+    }
+
+    if let Ok(info) = fetch::resolve_landing_page(url) {
+        if let Some(doi) = info.doi {
+            println!("Resolved DOI from page: {doi}");
+            return add_from_doi_with_pdf(library, &doi, info.pdf_url.as_deref(), force);
+        }
+        if let Some(pdf_url) = info.pdf_url {
+            println!("Resolved PDF from page: {pdf_url}");
+            return add_from_url(library, &pdf_url, force);
+        }
+    }
+
+    // The page yielded no DOI and no PDF link (often a JavaScript-rendered or
+    // bot-protected publisher page). Try the URL as a direct PDF, but if that
+    // fails, point the user at the reliable path rather than a raw error.
+    add_from_url(library, url, force).map_err(|e| {
+        anyhow::anyhow!(
+            "couldn't import {url}: {e}\n  \
+             No DOI or PDF link was found on the page — it may be \
+             JavaScript-rendered or bot-protected.\n  \
+             Try adding by DOI instead, e.g. `grimoire add 10.1234/...`."
+        )
+    })
+}
+
+/// If `reference` duplicates an existing entry and the import isn't forced,
+/// print a notice and return `true` (the caller should skip the import).
+fn skip_as_duplicate(library: &Path, reference: &crate::model::Reference, force: bool) -> bool {
+    if force {
+        return false;
+    }
+    match storage::find_duplicate(library, reference) {
+        Ok(Some((existing, reason))) => {
+            let name = existing.file_name().unwrap_or_default().to_string_lossy();
+            eprintln!("! duplicate of {name} ({reason} match) — skipping");
+            eprintln!("  use --force to add anyway");
+            true
+        }
+        _ => false,
+    }
 }
 
 pub fn index_reference(library: &Path, ref_dir: &Path, reference: &crate::model::Reference) {
@@ -162,9 +218,13 @@ pub fn index_reference(library: &Path, ref_dir: &Path, reference: &crate::model:
     }
 }
 
-fn add_from_arxiv(library: &Path, arxiv_id: &str) -> Result<()> {
+fn add_from_arxiv(library: &Path, arxiv_id: &str, force: bool) -> Result<()> {
     println!("Fetching metadata from arXiv: {}", arxiv_id);
     let mut reference = fetch::fetch_arxiv(arxiv_id)?;
+
+    if skip_as_duplicate(library, &reference, force) {
+        return Ok(());
+    }
 
     let ref_dir = storage::create_ref_dir(library, &reference)?;
     let pdf_filename = format!("{}.pdf", arxiv_id);
@@ -182,23 +242,97 @@ fn add_from_arxiv(library: &Path, arxiv_id: &str) -> Result<()> {
     Ok(())
 }
 
-fn add_from_doi(library: &Path, doi: &str) -> Result<()> {
+fn add_from_doi(library: &Path, doi: &str, force: bool) -> Result<()> {
+    add_from_doi_with_pdf(library, doi, None, force)
+}
+
+fn add_from_pubmed(library: &Path, pmid: &str, force: bool) -> Result<()> {
+    println!("Resolving PubMed {pmid} via NCBI...");
+    let reference = fetch::fetch_pubmed(pmid)?;
+    add_reference_with_pdf(library, reference, None, force)
+}
+
+/// Add a reference from a DOI (CrossRef metadata), optionally downloading a PDF
+/// from `pdf_url` (e.g. a publisher's `citation_pdf_url`). A failed PDF download
+/// is non-fatal — the metadata entry is still created.
+fn add_from_doi_with_pdf(
+    library: &Path,
+    doi: &str,
+    pdf_url: Option<&str>,
+    force: bool,
+) -> Result<()> {
     println!("Fetching metadata from CrossRef: {}", doi);
     let reference = fetch::fetch_crossref(doi)?;
+    add_reference_with_pdf(library, reference, pdf_url, force)
+}
+
+fn add_reference_with_pdf(
+    library: &Path,
+    mut reference: crate::model::Reference,
+    pdf_url: Option<&str>,
+    force: bool,
+) -> Result<()> {
+    if skip_as_duplicate(library, &reference, force) {
+        return Ok(());
+    }
 
     let ref_dir = storage::create_ref_dir(library, &reference)?;
+    let dir_name = ref_dir
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let pdf_filename = format!("{dir_name}.pdf");
+
+    let save_pdf = |bytes: Vec<u8>| -> Result<()> {
+        std::fs::write(ref_dir.join(&pdf_filename), bytes)
+            .with_context(|| format!("Failed to save PDF to {}", ref_dir.display()))
+    };
+
+    // 1. A PDF URL the caller already knows (e.g. a page's citation_pdf_url).
+    if let Some(url) = pdf_url {
+        match fetch::download_pdf(url) {
+            Ok(bytes) => {
+                save_pdf(bytes)?;
+                reference.files = vec![pdf_filename.clone()];
+            }
+            Err(e) => eprintln!("  (provided PDF URL failed: {e})"),
+        }
+    }
+
+    // 2. Fall back to an open-access copy via Unpaywall, keyed by DOI.
+    if reference.files.is_empty()
+        && let Some(doi) = reference.doi.clone()
+        && let Some(oa_url) = fetch::unpaywall_pdf_url(&doi)
+    {
+        match fetch::download_pdf(&oa_url) {
+            Ok(bytes) => {
+                save_pdf(bytes)?;
+                reference.files = vec![pdf_filename.clone()];
+                println!("  (open-access PDF via Unpaywall)");
+            }
+            Err(e) => eprintln!("  (Unpaywall PDF failed: {e})"),
+        }
+    }
+
     metadata::write_info(&ref_dir, &reference)?;
     index_reference(library, &ref_dir, &reference);
 
     println!("Added: {}", reference.title);
     println!("  → {}", ref_dir.display());
-    println!("  (no PDF — add one manually to the directory)");
+    if reference.files.is_empty() {
+        println!("  (no PDF — add one manually to the directory)");
+    }
     Ok(())
 }
 
-fn add_from_pmc(library: &Path, pmc_id: &str) -> Result<()> {
+fn add_from_pmc(library: &Path, pmc_id: &str, force: bool) -> Result<()> {
     println!("Resolving PMC article and downloading PDF: {pmc_id}");
     let (mut reference, bytes) = fetch::fetch_pmc(pmc_id)?;
+
+    if skip_as_duplicate(library, &reference, force) {
+        return Ok(());
+    }
 
     let ref_dir = storage::create_ref_dir(library, &reference)?;
     let pdf_filename = format!("{pmc_id}.pdf");
@@ -214,7 +348,7 @@ fn add_from_pmc(library: &Path, pmc_id: &str) -> Result<()> {
     Ok(())
 }
 
-fn add_from_file(library: &Path, path: &str) -> Result<()> {
+fn add_from_file(library: &Path, path: &str, force: bool) -> Result<()> {
     let path = PathBuf::from(path)
         .canonicalize()
         .with_context(|| format!("File not found: {}", path))?;
@@ -242,6 +376,10 @@ fn add_from_file(library: &Path, path: &str) -> Result<()> {
         }
     }
 
+    if skip_as_duplicate(library, &reference, force) {
+        return Ok(());
+    }
+
     let ref_dir = storage::create_ref_dir(library, &reference)?;
     let filename = storage::copy_pdf(&path, &ref_dir)?;
     reference.files = vec![filename];
@@ -253,7 +391,7 @@ fn add_from_file(library: &Path, path: &str) -> Result<()> {
     Ok(())
 }
 
-fn add_from_url(library: &Path, url: &str) -> Result<()> {
+fn add_from_url(library: &Path, url: &str, force: bool) -> Result<()> {
     println!("Downloading PDF from URL...");
     let bytes = fetch::download_pdf(url)?;
     let filename = reqwest::Url::parse(url)
@@ -272,7 +410,7 @@ fn add_from_url(library: &Path, url: &str) -> Result<()> {
     let tmp_path = tmp_dir.path().join(&filename);
     std::fs::write(&tmp_path, bytes)?;
 
-    add_from_file(library, tmp_path.to_str().unwrap())
+    add_from_file(library, tmp_path.to_str().unwrap(), force)
 }
 
 fn cmd_reindex(library: &Path) -> Result<()> {
