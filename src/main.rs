@@ -135,11 +135,15 @@ pub fn cmd_add(library: &Path, input: &str, force: bool) -> Result<()> {
         return add_from_pmc(library, &pmc_id, force);
     }
 
+    if let Some(pmid) = fetch::detect_pmid(input) {
+        return add_from_pubmed(library, &pmid, force);
+    }
+
     if input.starts_with("http://") || input.starts_with("https://") {
         if let Some(doi) = fetch::detect_doi_url(input) {
             return add_from_doi(library, &doi, force);
         }
-        return add_from_url(library, input, force);
+        return add_from_web_url(library, input, force);
     }
 
     if let Some(doi) = fetch::detect_doi(input) {
@@ -147,6 +151,28 @@ pub fn cmd_add(library: &Path, input: &str, force: bool) -> Result<()> {
     }
 
     anyhow::bail!("Not a file, URL, arXiv ID, or DOI: {}", input)
+}
+
+/// Import from an arbitrary web URL that isn't a recognized arXiv/PMC/doi.org
+/// link: try a DOI embedded in the URL, then the landing page's citation meta
+/// tags, and finally fall back to treating the URL as a direct PDF.
+fn add_from_web_url(library: &Path, url: &str, force: bool) -> Result<()> {
+    if let Some(doi) = fetch::detect_doi_in_url(url) {
+        return add_from_doi(library, &doi, force);
+    }
+
+    if let Ok(info) = fetch::resolve_landing_page(url) {
+        if let Some(doi) = info.doi {
+            println!("Resolved DOI from page: {doi}");
+            return add_from_doi_with_pdf(library, &doi, info.pdf_url.as_deref(), force);
+        }
+        if let Some(pdf_url) = info.pdf_url {
+            println!("Resolved PDF from page: {pdf_url}");
+            return add_from_url(library, &pdf_url, force);
+        }
+    }
+
+    add_from_url(library, url, force)
 }
 
 /// If `reference` duplicates an existing entry and the import isn't forced,
@@ -207,20 +233,62 @@ fn add_from_arxiv(library: &Path, arxiv_id: &str, force: bool) -> Result<()> {
 }
 
 fn add_from_doi(library: &Path, doi: &str, force: bool) -> Result<()> {
+    add_from_doi_with_pdf(library, doi, None, force)
+}
+
+fn add_from_pubmed(library: &Path, pmid: &str, force: bool) -> Result<()> {
+    println!("Resolving PubMed {pmid} via NCBI...");
+    let reference = fetch::fetch_pubmed(pmid)?;
+    add_reference_with_pdf(library, reference, None, force)
+}
+
+/// Add a reference from a DOI (CrossRef metadata), optionally downloading a PDF
+/// from `pdf_url` (e.g. a publisher's `citation_pdf_url`). A failed PDF download
+/// is non-fatal — the metadata entry is still created.
+fn add_from_doi_with_pdf(
+    library: &Path,
+    doi: &str,
+    pdf_url: Option<&str>,
+    force: bool,
+) -> Result<()> {
     println!("Fetching metadata from CrossRef: {}", doi);
     let reference = fetch::fetch_crossref(doi)?;
+    add_reference_with_pdf(library, reference, pdf_url, force)
+}
 
+fn add_reference_with_pdf(
+    library: &Path,
+    mut reference: crate::model::Reference,
+    pdf_url: Option<&str>,
+    force: bool,
+) -> Result<()> {
     if skip_as_duplicate(library, &reference, force) {
         return Ok(());
     }
 
     let ref_dir = storage::create_ref_dir(library, &reference)?;
+
+    if let Some(url) = pdf_url {
+        let dir_name = ref_dir.file_name().unwrap_or_default().to_string_lossy();
+        let pdf_filename = format!("{dir_name}.pdf");
+        match fetch::download_pdf(url) {
+            Ok(bytes) => {
+                std::fs::write(ref_dir.join(&pdf_filename), bytes)
+                    .with_context(|| format!("Failed to save PDF to {}", ref_dir.display()))?;
+                reference.files = vec![pdf_filename];
+            }
+            Err(e) => eprintln!("  (metadata added; PDF download failed: {e})"),
+        }
+    }
+
     metadata::write_info(&ref_dir, &reference)?;
     index_reference(library, &ref_dir, &reference);
 
     println!("Added: {}", reference.title);
     println!("  → {}", ref_dir.display());
-    println!("  (no PDF — add one manually to the directory)");
+    if reference.files.is_empty() {
+        println!("  (no PDF — add one manually to the directory)");
+    }
     Ok(())
 }
 

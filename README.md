@@ -139,7 +139,10 @@ l = [":insert-output grimoire cite --format latex", ":redraw"]
 - **arXiv ID** (`1706.03762`) — fetches metadata from arXiv API, downloads PDF
 - **arXiv URL** (`https://arxiv.org/abs/1706.03762`) — same
 - **PMC URL** (`https://pmc.ncbi.nlm.nih.gov/articles/PMC1234567/`) — resolves metadata and downloads an available publisher or PMC Open Access PDF
+- **PubMed URL / PMID** (`https://pubmed.ncbi.nlm.nih.gov/26017442/`, `PMID:26017442`) — resolves the DOI via NCBI, then fetches metadata from CrossRef
 - **DOI** (`10.1038/nature14539`) — fetches metadata from CrossRef
+- **DOI or doi.org URL** — a DOI embedded anywhere in a URL (e.g. a PLoS `?id=10.1371/…` link) is extracted automatically
+- **Publisher landing page** (`https://www.nature.com/articles/…`, ScienceDirect, Springer, etc.) — scrapes the page's `citation_doi` / `citation_pdf_url` meta tags to resolve metadata and, when the PDF is openly available, download it
 - **Direct PDF URL** — downloads only when the response contains PDF data
 - **Local PDF** (`paper.pdf`) — extracts metadata from PDF; if filename looks like an arXiv ID, fetches metadata from arXiv
 

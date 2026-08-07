@@ -478,12 +478,194 @@ fn is_pdf_bytes(bytes: &[u8]) -> bool {
     bytes.starts_with(b"%PDF-")
 }
 
+/// Extract a DOI embedded anywhere in a URL's path or query (e.g. a PLoS
+/// `?id=10.1371/...` link), trimming URL separators and a trailing `.pdf`.
+pub fn detect_doi_in_url(url: &str) -> Option<String> {
+    let decoded = urlencoding::decode(url)
+        .map(|c| c.into_owned())
+        .unwrap_or_else(|_| url.to_string());
+    let mut doi = detect_doi(&decoded)?;
+    // detect_doi's `[^\s]+` greedily swallows query/fragment; cut them off.
+    if let Some(i) = doi.find(['?', '#', '&']) {
+        doi.truncate(i);
+    }
+    let doi = doi.trim_end_matches(['.', ',', ';', ')', '/']);
+    let doi = doi.strip_suffix(".pdf").unwrap_or(doi);
+    (doi.len() > 3).then(|| doi.to_string())
+}
+
+/// Detect a PubMed article, either as a `pubmed.ncbi.nlm.nih.gov/<pmid>` URL or
+/// a `PMID:<n>` string. Returns the bare PMID.
+pub fn detect_pmid(input: &str) -> Option<String> {
+    let url_re =
+        Regex::new(r"(?i)^https?://(?:www\.)?pubmed\.ncbi\.nlm\.nih\.gov/(\d{4,9})/?$").unwrap();
+    if let Some(c) = url_re.captures(input) {
+        return c.get(1).map(|m| m.as_str().to_string());
+    }
+    let prefix_re = Regex::new(r"(?i)^pmid:\s*(\d{4,9})$").unwrap();
+    prefix_re
+        .captures(input)
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str().to_string())
+}
+
+/// Resolve a PubMed ID to a Reference by looking up its DOI via NCBI eutils and
+/// then fetching rich metadata from CrossRef.
+pub fn fetch_pubmed(pmid: &str) -> Result<Reference> {
+    let url = format!(
+        "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi?db=pubmed&id={}&retmode=json",
+        urlencoding::encode(pmid)
+    );
+    let body = http_client()?
+        .get(&url)
+        .send()
+        .context("Failed to reach NCBI eutils")?
+        .error_for_status()
+        .context("NCBI eutils returned an error")?
+        .text()?;
+    let doi = parse_pubmed_doi(&body, pmid)?;
+    fetch_crossref(&doi)
+}
+
+fn parse_pubmed_doi(json: &str, pmid: &str) -> Result<String> {
+    let v: serde_json::Value = serde_json::from_str(json).context("Invalid PubMed JSON")?;
+    let ids = v["result"][pmid]["articleids"]
+        .as_array()
+        .with_context(|| format!("No PubMed record for {pmid}"))?;
+    ids.iter()
+        .find(|id| id["idtype"].as_str() == Some("doi"))
+        .and_then(|id| id["value"].as_str())
+        .map(|s| s.trim().to_string())
+        .with_context(|| format!("PubMed record {pmid} has no DOI; try the DOI directly"))
+}
+
+/// DOI and/or direct PDF URL scraped from a publisher landing page's Highwire
+/// `<meta>` tags (`citation_doi`, `citation_pdf_url`) — the tags most academic
+/// publishers emit for Google Scholar.
+pub struct LandingInfo {
+    pub doi: Option<String>,
+    pub pdf_url: Option<String>,
+}
+
+pub fn resolve_landing_page(url: &str) -> Result<LandingInfo> {
+    let html = http_client()?
+        .get(url)
+        .send()
+        .with_context(|| format!("Failed to fetch page: {url}"))?
+        .error_for_status()
+        .with_context(|| format!("Page returned an error: {url}"))?
+        .text()?;
+
+    let doi = meta_content(&html, "citation_doi")
+        .or_else(|| meta_content(&html, "prism.doi"))
+        .or_else(|| meta_content(&html, "dc.identifier").filter(|s| s.contains("10.")))
+        .map(|d| {
+            d.trim()
+                .trim_start_matches("doi:")
+                .trim_start_matches("DOI:")
+                .trim()
+                .to_string()
+        })
+        .and_then(|d| detect_doi(&d));
+    let pdf_url = meta_content(&html, "citation_pdf_url").map(|u| resolve_relative(url, &u));
+
+    Ok(LandingInfo { doi, pdf_url })
+}
+
+/// Read a `<meta name="NAME" content="VALUE">` tag's content, tolerating either
+/// attribute order.
+fn meta_content(html: &str, name: &str) -> Option<String> {
+    let name = regex::escape(name);
+    let patterns = [
+        format!(r#"(?is)<meta[^>]*\bname=["']{name}["'][^>]*\bcontent=["']([^"']*)["']"#),
+        format!(r#"(?is)<meta[^>]*\bcontent=["']([^"']*)["'][^>]*\bname=["']{name}["']"#),
+    ];
+    for pat in patterns {
+        if let Some(c) = Regex::new(&pat).ok()?.captures(html)
+            && let Some(m) = c.get(1)
+        {
+            let val = m.as_str().trim();
+            if !val.is_empty() {
+                return Some(val.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn resolve_relative(base: &str, link: &str) -> String {
+    reqwest::Url::parse(base)
+        .and_then(|b| b.join(link))
+        .map(|u| u.to_string())
+        .unwrap_or_else(|_| link.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        detect_doi_url, detect_pmc_id, extract_pdf_from_oa_package, is_pdf_bytes,
-        parse_crossref_pdf_url, parse_pmc_doi_response, parse_pmc_oa_package_url,
+        detect_doi_in_url, detect_doi_url, detect_pmc_id, detect_pmid, extract_pdf_from_oa_package,
+        is_pdf_bytes, meta_content, parse_crossref_pdf_url, parse_pmc_doi_response,
+        parse_pmc_oa_package_url, parse_pubmed_doi,
     };
+
+    #[test]
+    fn extracts_doi_embedded_in_a_url() {
+        assert_eq!(
+            detect_doi_in_url("https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0123456"),
+            Some("10.1371/journal.pone.0123456".to_string())
+        );
+        // Encoded slash in the query.
+        assert_eq!(
+            detect_doi_in_url("https://example.org/article?id=10.1371%2Fjournal.pone.0123456"),
+            Some("10.1371/journal.pone.0123456".to_string())
+        );
+        // Trailing .pdf and fragment are trimmed.
+        assert_eq!(
+            detect_doi_in_url("https://host/pdf/10.1016/j.media.2022.102464.pdf#page=1"),
+            Some("10.1016/j.media.2022.102464".to_string())
+        );
+        assert_eq!(detect_doi_in_url("https://arxiv.org/abs/2301.12345"), None);
+    }
+
+    #[test]
+    fn detects_pmid_from_url_and_prefix() {
+        assert_eq!(
+            detect_pmid("https://pubmed.ncbi.nlm.nih.gov/35432197/"),
+            Some("35432197".to_string())
+        );
+        assert_eq!(detect_pmid("PMID: 35432197"), Some("35432197".to_string()));
+        assert_eq!(detect_pmid("https://pmc.ncbi.nlm.nih.gov/articles/PMC123/"), None);
+        assert_eq!(detect_pmid("just some text"), None);
+    }
+
+    #[test]
+    fn reads_meta_tags_in_either_attribute_order() {
+        let html = r#"<meta name="citation_doi" content="10.1038/s41586-021-03819-2">"#;
+        assert_eq!(
+            meta_content(html, "citation_doi"),
+            Some("10.1038/s41586-021-03819-2".to_string())
+        );
+        let reversed = r#"<meta content="https://x.org/a.pdf" name="citation_pdf_url" />"#;
+        assert_eq!(
+            meta_content(reversed, "citation_pdf_url"),
+            Some("https://x.org/a.pdf".to_string())
+        );
+        assert_eq!(meta_content(html, "citation_pdf_url"), None);
+    }
+
+    #[test]
+    fn parses_doi_from_pubmed_esummary() {
+        let json = r#"{"result":{"35432197":{"articleids":[
+            {"idtype":"pubmed","value":"35432197"},
+            {"idtype":"doi","value":"10.1038/s41586-021-03819-2"}
+        ]}}}"#;
+        assert_eq!(
+            parse_pubmed_doi(json, "35432197").unwrap(),
+            "10.1038/s41586-021-03819-2"
+        );
+        let no_doi = r#"{"result":{"1":{"articleids":[{"idtype":"pubmed","value":"1"}]}}}"#;
+        assert!(parse_pubmed_doi(no_doi, "1").is_err());
+    }
 
     fn oa_package(path: &str, contents: &[u8]) -> Vec<u8> {
         let mut compressed = Vec::new();
