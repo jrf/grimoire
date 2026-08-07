@@ -267,17 +267,41 @@ fn add_reference_with_pdf(
     }
 
     let ref_dir = storage::create_ref_dir(library, &reference)?;
+    let dir_name = ref_dir
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let pdf_filename = format!("{dir_name}.pdf");
 
+    let save_pdf = |bytes: Vec<u8>| -> Result<()> {
+        std::fs::write(ref_dir.join(&pdf_filename), bytes)
+            .with_context(|| format!("Failed to save PDF to {}", ref_dir.display()))
+    };
+
+    // 1. A PDF URL the caller already knows (e.g. a page's citation_pdf_url).
     if let Some(url) = pdf_url {
-        let dir_name = ref_dir.file_name().unwrap_or_default().to_string_lossy();
-        let pdf_filename = format!("{dir_name}.pdf");
         match fetch::download_pdf(url) {
             Ok(bytes) => {
-                std::fs::write(ref_dir.join(&pdf_filename), bytes)
-                    .with_context(|| format!("Failed to save PDF to {}", ref_dir.display()))?;
-                reference.files = vec![pdf_filename];
+                save_pdf(bytes)?;
+                reference.files = vec![pdf_filename.clone()];
             }
-            Err(e) => eprintln!("  (metadata added; PDF download failed: {e})"),
+            Err(e) => eprintln!("  (provided PDF URL failed: {e})"),
+        }
+    }
+
+    // 2. Fall back to an open-access copy via Unpaywall, keyed by DOI.
+    if reference.files.is_empty()
+        && let Some(doi) = reference.doi.clone()
+        && let Some(oa_url) = fetch::unpaywall_pdf_url(&doi)
+    {
+        match fetch::download_pdf(&oa_url) {
+            Ok(bytes) => {
+                save_pdf(bytes)?;
+                reference.files = vec![pdf_filename.clone()];
+                println!("  (open-access PDF via Unpaywall)");
+            }
+            Err(e) => eprintln!("  (Unpaywall PDF failed: {e})"),
         }
     }
 

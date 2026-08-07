@@ -321,16 +321,26 @@ fn parse_arxiv_response(xml: &str, arxiv_id: &str) -> Result<Reference> {
 
 fn parse_crossref_response(json: &str) -> Result<Reference> {
     let v: serde_json::Value = serde_json::from_str(json).context("Invalid CrossRef JSON")?;
-    let msg = &v["message"];
+    Ok(parse_csl_item(&v["message"]))
+}
 
-    let title = msg["title"]
-        .as_array()
-        .and_then(|a| a.first())
-        .and_then(|t| t.as_str())
-        .unwrap_or("Untitled")
-        .to_string();
+/// Parse a CSL-JSON item into a Reference. This is the shape shared by the
+/// CrossRef `message` object and NCBI's citation exporter, so DOI and PubMed
+/// imports run through the same mapping. Fields may be a string or a
+/// single-element array depending on the source, so both are accepted.
+fn parse_csl_item(item: &serde_json::Value) -> Reference {
+    let str_or_first = |v: &serde_json::Value| -> Option<String> {
+        v.as_str().map(str::to_string).or_else(|| {
+            v.as_array()
+                .and_then(|a| a.first())
+                .and_then(|t| t.as_str())
+                .map(str::to_string)
+        })
+    };
 
-    let authors: Vec<String> = msg["author"]
+    let title = str_or_first(&item["title"]).unwrap_or_else(|| "Untitled".to_string());
+
+    let authors: Vec<String> = item["author"]
         .as_array()
         .map(|arr| {
             arr.iter()
@@ -342,30 +352,26 @@ fn parse_crossref_response(json: &str) -> Result<Reference> {
                     } else if given.is_empty() {
                         Some(family.to_string())
                     } else {
-                        Some(format!("{} {}", given, family))
+                        Some(format!("{given} {family}"))
                     }
                 })
                 .collect()
         })
         .unwrap_or_default();
 
-    let year = msg["published-print"]["date-parts"][0][0]
+    // CSL uses `issued`; CrossRef adds published-print/-online/created fallbacks.
+    let year = item["issued"]["date-parts"][0][0]
         .as_u64()
-        .or_else(|| msg["published-online"]["date-parts"][0][0].as_u64())
-        .or_else(|| msg["created"]["date-parts"][0][0].as_u64())
+        .or_else(|| item["published-print"]["date-parts"][0][0].as_u64())
+        .or_else(|| item["published-online"]["date-parts"][0][0].as_u64())
+        .or_else(|| item["created"]["date-parts"][0][0].as_u64())
         .and_then(|y| u16::try_from(y).ok());
 
-    let doi = msg["DOI"].as_str().map(|s| s.to_string());
+    let doi = item["DOI"].as_str().map(|s| s.to_string());
+    let journal = str_or_first(&item["container-title"]);
+    let abstract_text = item["abstract"].as_str().map(clean_abstract);
 
-    let journal = msg["container-title"]
-        .as_array()
-        .and_then(|a| a.first())
-        .and_then(|t| t.as_str())
-        .map(|s| s.to_string());
-
-    let abstract_text = msg["abstract"].as_str().map(clean_abstract);
-
-    Ok(Reference {
+    Reference {
         title,
         authors,
         year,
@@ -375,7 +381,7 @@ fn parse_crossref_response(json: &str) -> Result<Reference> {
         tags: vec![],
         files: vec![],
         r#abstract: abstract_text,
-    })
+    }
 }
 
 fn parse_pmc_doi_response(json: &str, pmc_id: &str) -> Result<String> {
@@ -509,34 +515,52 @@ pub fn detect_pmid(input: &str) -> Option<String> {
         .map(|m| m.as_str().to_string())
 }
 
-/// Resolve a PubMed ID to a Reference by looking up its DOI via NCBI eutils and
-/// then fetching rich metadata from CrossRef.
+/// Resolve a PubMed ID to a Reference via NCBI's Literature Citation Exporter,
+/// which returns CSL-JSON directly — so this works even for records that carry
+/// no DOI (unlike a DOI-then-CrossRef round trip).
 pub fn fetch_pubmed(pmid: &str) -> Result<Reference> {
     let url = format!(
-        "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi?db=pubmed&id={}&retmode=json",
+        "https://api.ncbi.nlm.nih.gov/lit/ctxp/v1/pubmed/?format=csl&id={}",
         urlencoding::encode(pmid)
     );
     let body = http_client()?
         .get(&url)
         .send()
-        .context("Failed to reach NCBI eutils")?
+        .context("Failed to reach NCBI citation exporter")?
         .error_for_status()
-        .context("NCBI eutils returned an error")?
+        .context("NCBI citation exporter returned an error")?
         .text()?;
-    let doi = parse_pubmed_doi(&body, pmid)?;
-    fetch_crossref(&doi)
+    let v: serde_json::Value = serde_json::from_str(&body).context("Invalid PubMed CSL JSON")?;
+    // The exporter returns a single CSL object, or an array when given many ids.
+    let item = v.as_array().and_then(|a| a.first()).unwrap_or(&v);
+    let reference = parse_csl_item(item);
+    anyhow::ensure!(
+        reference.title != "Untitled" || reference.doi.is_some(),
+        "No metadata found for PMID {pmid}"
+    );
+    Ok(reference)
 }
 
-fn parse_pubmed_doi(json: &str, pmid: &str) -> Result<String> {
-    let v: serde_json::Value = serde_json::from_str(json).context("Invalid PubMed JSON")?;
-    let ids = v["result"][pmid]["articleids"]
-        .as_array()
-        .with_context(|| format!("No PubMed record for {pmid}"))?;
-    ids.iter()
-        .find(|id| id["idtype"].as_str() == Some("doi"))
-        .and_then(|id| id["value"].as_str())
-        .map(|s| s.trim().to_string())
-        .with_context(|| format!("PubMed record {pmid} has no DOI; try the DOI directly"))
+/// Look up an open-access PDF URL for a DOI via Unpaywall. Best-effort: any
+/// network/parse error or absence of free full text yields `None`.
+pub fn unpaywall_pdf_url(doi: &str) -> Option<String> {
+    let url = format!(
+        "https://api.unpaywall.org/v2/{}?email=jrfetzer@gmail.com",
+        urlencoding::encode(doi)
+    );
+    let body = http_client()
+        .ok()?
+        .get(&url)
+        .send()
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .text()
+        .ok()?;
+    let v: serde_json::Value = serde_json::from_str(&body).ok()?;
+    v["best_oa_location"]["url_for_pdf"]
+        .as_str()
+        .map(str::to_string)
 }
 
 /// DOI and/or direct PDF URL scraped from a publisher landing page's Highwire
@@ -604,8 +628,8 @@ fn resolve_relative(base: &str, link: &str) -> String {
 mod tests {
     use super::{
         detect_doi_in_url, detect_doi_url, detect_pmc_id, detect_pmid, extract_pdf_from_oa_package,
-        is_pdf_bytes, meta_content, parse_crossref_pdf_url, parse_pmc_doi_response,
-        parse_pmc_oa_package_url, parse_pubmed_doi,
+        is_pdf_bytes, meta_content, parse_crossref_pdf_url, parse_csl_item, parse_pmc_doi_response,
+        parse_pmc_oa_package_url,
     };
 
     #[test]
@@ -654,17 +678,32 @@ mod tests {
     }
 
     #[test]
-    fn parses_doi_from_pubmed_esummary() {
-        let json = r#"{"result":{"35432197":{"articleids":[
-            {"idtype":"pubmed","value":"35432197"},
-            {"idtype":"doi","value":"10.1038/s41586-021-03819-2"}
-        ]}}}"#;
-        assert_eq!(
-            parse_pubmed_doi(json, "35432197").unwrap(),
-            "10.1038/s41586-021-03819-2"
-        );
-        let no_doi = r#"{"result":{"1":{"articleids":[{"idtype":"pubmed","value":"1"}]}}}"#;
-        assert!(parse_pubmed_doi(no_doi, "1").is_err());
+    fn parses_csl_item_with_string_or_array_fields() {
+        // PubMed CSL shape: title/container-title are plain strings, date in `issued`.
+        let csl = serde_json::json!({
+            "title": "Deep learning",
+            "container-title": "Nature",
+            "author": [{"family": "LeCun", "given": "Yann"}, {"family": "Bengio", "given": "Yoshua"}],
+            "issued": {"date-parts": [[2015, 5, 28]]},
+            "DOI": "10.1038/nature14539"
+        });
+        let r = parse_csl_item(&csl);
+        assert_eq!(r.title, "Deep learning");
+        assert_eq!(r.journal.as_deref(), Some("Nature"));
+        assert_eq!(r.authors, vec!["Yann LeCun", "Yoshua Bengio"]);
+        assert_eq!(r.year, Some(2015));
+        assert_eq!(r.doi.as_deref(), Some("10.1038/nature14539"));
+
+        // CrossRef shape: title/container-title are arrays, date in published-print.
+        let crossref = serde_json::json!({
+            "title": ["Attention Is All You Need"],
+            "container-title": ["NeurIPS"],
+            "published-print": {"date-parts": [[2017]]}
+        });
+        let r2 = parse_csl_item(&crossref);
+        assert_eq!(r2.title, "Attention Is All You Need");
+        assert_eq!(r2.journal.as_deref(), Some("NeurIPS"));
+        assert_eq!(r2.year, Some(2017));
     }
 
     fn oa_package(path: &str, contents: &[u8]) -> Vec<u8> {
