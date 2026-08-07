@@ -47,7 +47,22 @@ pub fn read_info(dir: &Path) -> Result<Reference> {
 pub fn write_info(dir: &Path, reference: &Reference) -> Result<()> {
     let path = dir.join("info.toml");
     let contents = toml::to_string_pretty(reference)?;
-    std::fs::write(&path, contents)?;
+    atomic_write(&path, contents.as_bytes())
+        .with_context(|| format!("Failed to write {}", path.display()))
+}
+
+/// Write `contents` to `path` atomically: stage into a sibling temp file, flush
+/// it to disk, then rename over the destination. A crash or full disk mid-write
+/// leaves either the old file or the complete new one — never a truncated
+/// `info.toml` that would silently drop the reference on the next read.
+fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)
+        .with_context(|| format!("Failed to create temp file in {}", dir.display()))?;
+    tmp.write_all(contents)?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(path).map_err(|e| e.error)?;
     Ok(())
 }
 

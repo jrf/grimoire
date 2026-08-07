@@ -97,10 +97,10 @@ struct ValidatePopup {
 }
 
 type FieldDiff = (String, String, String); // (field, old, new)
-type EnrichItem = (usize, Reference, Vec<FieldDiff>); // (entry idx, updated ref, diffs)
+type EnrichItem = (PathBuf, Reference, Vec<FieldDiff>); // (entry dir, updated ref, diffs)
 
 struct EnrichPreview {
-    idx: usize,
+    dir: PathBuf,
     updated: Reference,
     diffs: Vec<FieldDiff>,
     scroll: u16,
@@ -406,10 +406,10 @@ fn run_event_loop(terminal: &mut Term, app: &mut App, tty_ctl: &mut File) -> Res
                             Some(("Nothing to enrich".to_string(), std::time::Instant::now()));
                     } else {
                         let mut queue = items;
-                        let (idx, updated, diffs) = queue.remove(0);
-                        app.jump_to_entry(idx);
+                        let (dir, updated, diffs) = queue.remove(0);
+                        app.jump_to_entry(&dir);
                         app.enrich_preview = Some(EnrichPreview {
-                            idx,
+                            dir,
                             updated,
                             diffs,
                             scroll: 0,
@@ -1102,7 +1102,13 @@ impl App {
         tty_ctl.execute(EnterAlternateScreen)?;
         terminal::enable_raw_mode()?;
         terminal.clear()?;
-        status?;
+
+        // A failure to launch the editor (e.g. a mis-configured $EDITOR) must
+        // not tear down the whole TUI — report it and stay in the session.
+        if let Err(e) = status {
+            self.flash = Some((format!("Editor failed: {e}"), std::time::Instant::now()));
+            return Ok(());
+        }
 
         let idx = self.filtered_indices[self.list_state.selected().unwrap_or(0)];
         if let Ok(r) = metadata::read_info(&self.entries[idx].dir) {
@@ -1326,7 +1332,7 @@ impl App {
                     if diffs.is_empty() {
                         vec![]
                     } else {
-                        vec![(idx, updated, diffs)]
+                        vec![(dir, updated, diffs)]
                     }
                 }
                 _ => vec![],
@@ -1340,12 +1346,11 @@ impl App {
             return;
         }
 
-        let work: Vec<(usize, PathBuf, Reference)> = self
+        let work: Vec<(PathBuf, Reference)> = self
             .entries
             .iter()
-            .enumerate()
-            .filter(|(_, e)| needs_enrich(&e.reference))
-            .map(|(i, e)| (i, e.dir.clone(), e.reference.clone()))
+            .filter(|e| needs_enrich(&e.reference))
+            .map(|e| (e.dir.clone(), e.reference.clone()))
             .collect();
 
         if work.is_empty() {
@@ -1362,11 +1367,11 @@ impl App {
 
         std::thread::spawn(move || {
             let mut items: Vec<EnrichItem> = Vec::new();
-            for (idx, dir, reference) in work {
+            for (dir, reference) in work {
                 if let Ok(Some(updated)) = enrich_entry(&dir, &reference) {
                     let diffs = compute_diffs(&reference, &updated);
                     if !diffs.is_empty() {
-                        items.push((idx, updated, diffs));
+                        items.push((dir, updated, diffs));
                     }
                 }
             }
@@ -1380,9 +1385,14 @@ impl App {
             None => return,
         };
         let library = self.config.library_dir();
-        let _ = metadata::write_info(&self.entries[ep.idx].dir, &ep.updated);
-        crate::index_reference(&library, &self.entries[ep.idx].dir, &ep.updated);
-        self.update_entry_display(ep.idx, ep.updated);
+        // Write to disk by directory path (stable), independent of the entry's
+        // current position in the list — which may have shifted while the
+        // background fetch was in flight.
+        let _ = metadata::write_info(&ep.dir, &ep.updated);
+        crate::index_reference(&library, &ep.dir, &ep.updated);
+        if let Some(idx) = self.entries.iter().position(|e| e.dir == ep.dir) {
+            self.update_entry_display(idx, ep.updated);
+        }
         let applied = ep.applied + 1;
         self.advance_enrich_queue(ep.batch_queue, applied, ep.skipped);
     }
@@ -1419,10 +1429,10 @@ impl App {
             self.flash = Some((msg, std::time::Instant::now()));
             return;
         }
-        let (idx, updated, diffs) = queue.remove(0);
-        self.jump_to_entry(idx);
+        let (dir, updated, diffs) = queue.remove(0);
+        self.jump_to_entry(&dir);
         self.enrich_preview = Some(EnrichPreview {
-            idx,
+            dir,
             updated,
             diffs,
             scroll: 0,
@@ -1432,7 +1442,10 @@ impl App {
         });
     }
 
-    fn jump_to_entry(&mut self, entry_idx: usize) {
+    fn jump_to_entry(&mut self, dir: &Path) {
+        let Some(entry_idx) = self.entries.iter().position(|e| e.dir.as_path() == dir) else {
+            return;
+        };
         if let Some(pos) = self.filtered_indices.iter().position(|&i| i == entry_idx) {
             self.list_state.select(Some(pos));
             self.preview_scroll = 0;
@@ -1745,26 +1758,42 @@ fn draw(f: &mut Frame, app: &mut App) {
 
     // Status bar as bottom title of list
     let count_str = format!(" {}/{} ", app.filtered_indices.len(), app.entries.len());
-    let mode_indicator = match app.input_mode {
-        InputMode::Browse => Span::styled(
-            " BROWSE ",
+    let mode_indicator = if app.add_input.is_some() {
+        // Add mode is orthogonal to Browse/Search (it's a text-entry overlay),
+        // so it gets its own indicator with a distinct accent.
+        Span::styled(
+            " ADD ",
             Style::default()
                 .fg(t.status_fg)
-                .bg(t.normal_bg)
+                .bg(t.highlight)
                 .add_modifier(Modifier::BOLD),
-        ),
-        InputMode::Search => Span::styled(
-            " SEARCH ",
-            Style::default()
-                .fg(t.status_fg)
-                .bg(t.insert_bg)
-                .add_modifier(Modifier::BOLD),
-        ),
+        )
+    } else {
+        match app.input_mode {
+            InputMode::Browse => Span::styled(
+                " BROWSE ",
+                Style::default()
+                    .fg(t.status_fg)
+                    .bg(t.normal_bg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            InputMode::Search => Span::styled(
+                " SEARCH ",
+                Style::default()
+                    .fg(t.status_fg)
+                    .bg(t.insert_bg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        }
     };
-    let mode_hint = match (app.input_mode, &app.mode) {
-        (InputMode::Search, _) => " esc browse ",
-        (InputMode::Browse, Mode::Browse) => " / search  c clear  q quit ",
-        (InputMode::Browse, Mode::Cite { .. }) => " / search  c clear  q quit ",
+    let mode_hint = if app.add_input.is_some() {
+        " enter add  esc cancel "
+    } else {
+        match (app.input_mode, &app.mode) {
+            (InputMode::Search, _) => " esc browse ",
+            (InputMode::Browse, Mode::Browse) => " / search  c clear  q quit ",
+            (InputMode::Browse, Mode::Cite { .. }) => " / search  c clear  q quit ",
+        }
     };
     let mut bottom_spans = vec![mode_indicator, Span::styled(count_str, s_muted)];
     if let Some(flash) = app.flash_message() {
@@ -2052,7 +2081,7 @@ fn draw(f: &mut Frame, app: &mut App) {
 
     // Enrich preview popup
     if let Some(ref ep) = app.enrich_preview {
-        let title_text = truncate_ellipsis(&app.entries[ep.idx].reference.title, 40);
+        let title_text = truncate_ellipsis(&ep.updated.title, 40);
         let batch_info = if !ep.batch_queue.is_empty() || ep.applied > 0 || ep.skipped > 0 {
             let remaining = ep.batch_queue.len() + 1;
             let total = ep.applied + ep.skipped + remaining;

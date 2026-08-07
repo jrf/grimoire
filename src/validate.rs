@@ -43,8 +43,23 @@ pub fn validate(library: &Path, fix: bool) -> Result<ValidateResult> {
             .to_string();
 
         let toml_path = ref_dir.join("info.toml");
-        let content = std::fs::read_to_string(&toml_path)?;
-        let reference: Reference = toml::from_str(&content)?;
+        // A single unreadable/malformed info.toml must not abort validation of
+        // the rest of the library — report it as an issue and move on. (The tool
+        // whose job is finding integrity problems has to survive one.)
+        let content = match std::fs::read_to_string(&toml_path) {
+            Ok(c) => c,
+            Err(e) => {
+                issues.push(format!("unreadable info.toml: {dir_name} ({e})"));
+                continue;
+            }
+        };
+        let reference: Reference = match toml::from_str(&content) {
+            Ok(r) => r,
+            Err(e) => {
+                issues.push(format!("malformed info.toml: {dir_name} ({e})"));
+                continue;
+            }
+        };
 
         if reference.title.is_empty() {
             issues.push(format!("missing title: {}", dir_name));

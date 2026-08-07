@@ -1,8 +1,24 @@
 use anyhow::{Context, Result};
 use regex::Regex;
 use std::io::Read;
+use std::time::Duration;
 
 use crate::model::Reference;
+
+const USER_AGENT: &str = "Grimoire/0.1 (reference manager; mailto:jrfetzer@gmail.com)";
+
+/// Shared blocking HTTP client with connect and overall timeouts, so a slow or
+/// half-open server can never hang the app indefinitely. Every network call
+/// goes through this rather than `Client::new()`/`blocking::get`, which have no
+/// timeout by default.
+fn http_client() -> Result<reqwest::blocking::Client> {
+    reqwest::blocking::Client::builder()
+        .user_agent(USER_AGENT)
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
+        .build()
+        .context("Failed to build HTTP client")
+}
 
 fn clean_abstract(s: &str) -> String {
     let tag_re = Regex::new(r"<[^>]+>").unwrap();
@@ -53,8 +69,12 @@ pub fn detect_pmc_id(input: &str) -> Option<String> {
 pub fn fetch_arxiv(arxiv_id: &str) -> Result<Reference> {
     let id_clean = arxiv_id.trim_end_matches(".pdf");
     let url = format!("https://export.arxiv.org/api/query?id_list={}", id_clean);
-    let body = reqwest::blocking::get(&url)
+    let body = http_client()?
+        .get(&url)
+        .send()
         .context("Failed to reach arXiv API")?
+        .error_for_status()
+        .context("arXiv API returned an error")?
         .text()?;
 
     parse_arxiv_response(&body, id_clean)
@@ -63,10 +83,19 @@ pub fn fetch_arxiv(arxiv_id: &str) -> Result<Reference> {
 pub fn download_arxiv_pdf(arxiv_id: &str, dest: &std::path::Path) -> Result<()> {
     let id_clean = arxiv_id.trim_end_matches(".pdf");
     let url = format!("https://arxiv.org/pdf/{}.pdf", id_clean);
-    let bytes = reqwest::blocking::get(&url)
+    let bytes = http_client()?
+        .get(&url)
+        .send()
         .context("Failed to download PDF from arXiv")?
+        .error_for_status()
+        .context("arXiv PDF download returned an error")?
         .bytes()?;
 
+    anyhow::ensure!(
+        is_pdf_bytes(&bytes),
+        "arXiv did not return a PDF (got {} bytes of non-PDF content)",
+        bytes.len()
+    );
     std::fs::write(dest, &bytes)?;
     Ok(())
 }
@@ -76,14 +105,12 @@ pub fn search_crossref_by_title(title: &str) -> Result<Reference> {
         "https://api.crossref.org/works?query.title={}&rows=1",
         urlencoding::encode(title)
     );
-    let body = reqwest::blocking::Client::new()
+    let body = http_client()?
         .get(&url)
-        .header(
-            "User-Agent",
-            "Grimoire/0.1 (reference manager; mailto:jrfetzer@gmail.com)",
-        )
         .send()
         .context("Failed to reach CrossRef API")?
+        .error_for_status()
+        .context("CrossRef API returned an error")?
         .text()?;
 
     let v: serde_json::Value = serde_json::from_str(&body).context("Invalid CrossRef JSON")?;
@@ -132,9 +159,8 @@ pub fn fetch_pmc(pmc_id: &str) -> Result<(Reference, Vec<u8>)> {
         "https://www.ncbi.nlm.nih.gov/pmc/utils/idconv/v1.0/?ids={}&format=json&tool=grimoire",
         urlencoding::encode(pmc_id)
     );
-    let body = reqwest::blocking::Client::new()
+    let body = http_client()?
         .get(&url)
-        .header("User-Agent", "Grimoire/0.1 (reference manager)")
         .send()
         .context("Failed to reach NCBI PMC ID Converter")?
         .error_for_status()
@@ -159,9 +185,8 @@ pub fn fetch_pmc(pmc_id: &str) -> Result<(Reference, Vec<u8>)> {
 }
 
 pub fn download_pdf(url: &str) -> Result<Vec<u8>> {
-    let response = reqwest::blocking::Client::new()
+    let response = http_client()?
         .get(url)
-        .header("User-Agent", "Grimoire/0.1 (reference manager)")
         .send()
         .with_context(|| format!("Failed to download PDF: {url}"))?
         .error_for_status()
@@ -173,12 +198,8 @@ pub fn download_pdf(url: &str) -> Result<Vec<u8>> {
 
 fn fetch_crossref_body(doi: &str) -> Result<String> {
     let url = format!("https://api.crossref.org/works/{}", doi);
-    Ok(reqwest::blocking::Client::new()
+    Ok(http_client()?
         .get(&url)
-        .header(
-            "User-Agent",
-            "Grimoire/0.1 (reference manager; mailto:jrfetzer@gmail.com)",
-        )
         .send()
         .context("Failed to reach CrossRef API")?
         .error_for_status()
@@ -191,9 +212,8 @@ fn download_pmc_oa_pdf(pmc_id: &str) -> Result<Vec<u8>> {
         "https://www.ncbi.nlm.nih.gov/pmc/utils/oa/oa.fcgi?id={}",
         urlencoding::encode(pmc_id)
     );
-    let body = reqwest::blocking::Client::new()
+    let body = http_client()?
         .get(&url)
-        .header("User-Agent", "Grimoire/0.1 (reference manager)")
         .send()
         .context("Failed to reach NCBI PMC Open Access API")?
         .error_for_status()
@@ -204,9 +224,8 @@ fn download_pmc_oa_pdf(pmc_id: &str) -> Result<Vec<u8>> {
         .strip_prefix("ftp://")
         .map(|rest| format!("https://{rest}"))
         .unwrap_or(package_url);
-    let bytes = reqwest::blocking::Client::new()
+    let bytes = http_client()?
         .get(&package_url)
-        .header("User-Agent", "Grimoire/0.1 (reference manager)")
         .send()
         .context("Failed to download PMC Open Access package")?
         .error_for_status()
