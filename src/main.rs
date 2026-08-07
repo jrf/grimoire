@@ -172,7 +172,17 @@ fn add_from_web_url(library: &Path, url: &str, force: bool) -> Result<()> {
         }
     }
 
-    add_from_url(library, url, force)
+    // The page yielded no DOI and no PDF link (often a JavaScript-rendered or
+    // bot-protected publisher page). Try the URL as a direct PDF, but if that
+    // fails, point the user at the reliable path rather than a raw error.
+    add_from_url(library, url, force).map_err(|e| {
+        anyhow::anyhow!(
+            "couldn't import {url}: {e}\n  \
+             No DOI or PDF link was found on the page — it may be \
+             JavaScript-rendered or bot-protected.\n  \
+             Try adding by DOI instead, e.g. `grimoire add 10.1234/...`."
+        )
+    })
 }
 
 /// If `reference` duplicates an existing entry and the import isn't forced,

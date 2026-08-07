@@ -148,6 +148,14 @@ l = [":insert-output grimoire cite --format latex", ":redraw"]
 - **Direct PDF URL** — downloads only when the response contains PDF data
 - **Local PDF** (`paper.pdf`) — extracts metadata from PDF; if filename looks like an arXiv ID, fetches metadata from arXiv
 
+> **Prefer the DOI for publisher pages.** Some sites can't be imported from
+> their article URL: JavaScript-rendered pages (e.g. IEEE Xplore) expose no DOI
+> or PDF link in the HTML we fetch, and bot-protected pages (e.g. MDPI behind
+> Cloudflare) refuse the request outright. No tool that doesn't run a full
+> browser can scrape these. Add them by **DOI** instead — metadata always
+> resolves via CrossRef, and an open-access PDF is fetched via Unpaywall when a
+> reachable copy exists.
+
 If an incoming reference matches an existing entry by DOI or normalized title,
 `add` warns and skips it; pass `--force` to import anyway. The interactive
 deduplicator (`d` in the TUI) groups existing references that share a title
