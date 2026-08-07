@@ -52,6 +52,12 @@ impl SortMode {
             SortMode::Title => "title",
         }
     }
+
+    /// The direction a field sorts in when first selected. Year reads best
+    /// newest-first; the text fields read best A→Z.
+    fn defaults_descending(self) -> bool {
+        matches!(self, SortMode::Year)
+    }
 }
 
 struct Entry {
@@ -87,6 +93,8 @@ pub struct App {
     enrich_preview: Option<EnrichPreview>,
     enrich_rx: Option<mpsc::Receiver<Vec<EnrichItem>>>,
     sort_mode: SortMode,
+    /// Flip the current sort field away from its default direction (`S` key).
+    sort_reverse: bool,
     validate_popup: Option<ValidatePopup>,
 }
 
@@ -758,6 +766,13 @@ fn run_event_loop(terminal: &mut Term, app: &mut App, tty_ctl: &mut File) -> Res
                     }
                     (KeyCode::Char('s'), KeyModifiers::NONE) if app.filter.is_empty() => {
                         app.sort_mode = app.sort_mode.next();
+                        app.sort_reverse = false;
+                        app.rebuild_filter();
+                    }
+                    (KeyCode::Char('S'), KeyModifiers::SHIFT | KeyModifiers::NONE)
+                        if app.filter.is_empty() =>
+                    {
+                        app.sort_reverse = !app.sort_reverse;
                         app.rebuild_filter();
                     }
 
@@ -854,6 +869,7 @@ impl App {
             enrich_preview: None,
             enrich_rx: None,
             sort_mode: SortMode::Name,
+            sort_reverse: false,
             validate_popup: None,
         };
 
@@ -908,10 +924,11 @@ impl App {
 
     fn apply_sort(&mut self) {
         let entries = &self.entries;
+        let reverse = self.sort_reverse;
         self.filtered_indices.sort_by(|&a, &b| {
             let ea = &entries[a];
             let eb = &entries[b];
-            match self.sort_mode {
+            let ordering = match self.sort_mode {
                 SortMode::Name => ea.dir_name.cmp(&eb.dir_name),
                 SortMode::Author => {
                     let last_name = |s: &str| -> String {
@@ -948,6 +965,11 @@ impl App {
                     .title
                     .to_lowercase()
                     .cmp(&eb.reference.title.to_lowercase()),
+            };
+            if reverse {
+                ordering.reverse()
+            } else {
+                ordering
             }
         });
     }
@@ -1326,7 +1348,7 @@ impl App {
         self.enrich_rx = Some(rx);
 
         std::thread::spawn(move || {
-            let result = match enrich_entry(&dir, &reference) {
+            let result = match crate::enrich::enrich_entry(&dir, &reference) {
                 Ok(Some(updated)) => {
                     let diffs = compute_diffs(&reference, &updated);
                     if diffs.is_empty() {
@@ -1368,7 +1390,7 @@ impl App {
         std::thread::spawn(move || {
             let mut items: Vec<EnrichItem> = Vec::new();
             for (dir, reference) in work {
-                if let Ok(Some(updated)) = enrich_entry(&dir, &reference) {
+                if let Ok(Some(updated)) = crate::enrich::enrich_entry(&dir, &reference) {
                     let diffs = compute_diffs(&reference, &updated);
                     if !diffs.is_empty() {
                         items.push((dir, updated, diffs));
@@ -1587,59 +1609,6 @@ fn needs_enrich(r: &Reference) -> bool {
         || r.doi.is_none()
 }
 
-fn enrich_entry(dir: &Path, r: &Reference) -> Result<Option<Reference>> {
-    use crate::fetch;
-
-    let arxiv_id = r
-        .arxiv
-        .clone()
-        .or_else(|| r.files.iter().find_map(|f| fetch::detect_arxiv_id(f)));
-
-    let fetched = if let Some(ref id) = arxiv_id {
-        fetch::fetch_arxiv(id).ok()
-    } else if let Some(ref doi) = r.doi {
-        fetch::fetch_crossref(doi).ok()
-    } else {
-        // Try to detect arXiv ID from directory name
-        let dir_name = dir.file_name().unwrap_or_default().to_string_lossy();
-        if let Some(id) = fetch::detect_arxiv_id(&dir_name) {
-            fetch::fetch_arxiv(&id).ok()
-        } else if !r.title.is_empty() {
-            fetch::search_crossref_by_title(&r.title).ok()
-        } else {
-            return Ok(None);
-        }
-    };
-
-    let fetched = match fetched {
-        Some(f) => f,
-        None => return Ok(None),
-    };
-
-    let mut updated = r.clone();
-
-    if updated.year.is_none() || updated.year == Some(0) {
-        updated.year = fetched.year;
-    }
-    if updated.authors.is_empty() {
-        updated.authors = fetched.authors;
-    }
-    if updated.r#abstract.is_none() {
-        updated.r#abstract = fetched.r#abstract;
-    }
-    if updated.doi.is_none() {
-        updated.doi = fetched.doi;
-    }
-    if updated.arxiv.is_none() {
-        updated.arxiv = fetched.arxiv;
-    }
-    if updated.journal.is_none() {
-        updated.journal = fetched.journal;
-    }
-
-    Ok(Some(updated))
-}
-
 fn is_importable(input: &str) -> bool {
     use crate::fetch;
     let trimmed = input.trim();
@@ -1803,14 +1772,20 @@ fn draw(f: &mut Frame, app: &mut App) {
     }
     let bottom_left = Line::from(bottom_spans);
 
-    let sort_right = if app.sort_mode != SortMode::Name && app.filter.is_empty() {
-        Line::from(Span::styled(
-            format!(" sort: {} ", app.sort_mode.label()),
-            s_hl,
-        ))
-    } else {
-        Line::default()
-    };
+    // Show the sort indicator whenever the ordering isn't the clean default
+    // (name, ascending). The arrow reflects the effective direction: a field's
+    // default direction, flipped by `sort_reverse`.
+    let sort_right =
+        if app.filter.is_empty() && (app.sort_mode != SortMode::Name || app.sort_reverse) {
+            let descending = app.sort_mode.defaults_descending() ^ app.sort_reverse;
+            let arrow = if descending { "↓" } else { "↑" };
+            Line::from(Span::styled(
+                format!(" sort: {} {} ", app.sort_mode.label(), arrow),
+                s_hl,
+            ))
+        } else {
+            Line::default()
+        };
 
     if show_list {
         let list_block = Block::default()
@@ -1920,7 +1895,10 @@ fn draw(f: &mut Frame, app: &mut App) {
                         .bg(t.selection)
                         .add_modifier(Modifier::BOLD),
                 )
-                .highlight_symbol(" > ");
+                // Selection is shown by the row's background highlight; keep a
+                // blank 3-col gutter (matching prefix_width) so titles stay
+                // aligned and wrapped continuation lines indent correctly.
+                .highlight_symbol("   ");
 
             f.render_stateful_widget(list, list_inner, &mut app.list_state);
         }
@@ -2208,6 +2186,7 @@ fn draw(f: &mut Frame, app: &mut App) {
             ("r", "Enrich selected (fetch metadata)"),
             ("R", "Enrich all with missing fields"),
             ("s", "Cycle sort (name/author/year/title)"),
+            ("S", "Reverse sort direction"),
             ("d", "Deduplicate library"),
             ("I", "Reindex library"),
             ("V", "Validate library (auto-fix)"),

@@ -40,6 +40,9 @@ grimoire cite --format typst      # pick a reference, output @cite-key
 grimoire export --format yaml     # dump all references to stdout as YAML
 grimoire export --format hayagriva # ...or json / bibtex / hayagriva (Typst)
 grimoire export -f bibtex --tag video -o refs.bib  # filter by tag, write to a file
+grimoire backfill                 # fetch missing PDFs + abstracts for existing entries
+grimoire backfill --check         # report how many entries are missing a PDF / abstract
+grimoire backfill --pdfs-only     # only download missing PDFs (open-access)
 grimoire reindex                  # rebuild search index from filesystem
 grimoire validate                 # check library integrity
 grimoire validate --fix           # auto-fix issues (rename temp files, remove junk)
@@ -160,3 +163,26 @@ If an incoming reference matches an existing entry by DOI or normalized title,
 `add` warns and skips it; pass `--force` to import anyway. The interactive
 deduplicator (`d` in the TUI) groups existing references that share a title
 **or** DOI so you can merge them after the fact.
+
+## Backfill
+
+`grimoire backfill` fills gaps in entries you already have — it never touches an
+entry that already has the thing, so it is safe to run (and re-run) anytime:
+
+- **Missing PDFs** — for entries with a DOI but no PDF, it looks up an
+  open-access copy via Unpaywall (preferring repository copies, which rarely
+  block automated downloads) and falls back to any PDF link CrossRef lists.
+- **Missing abstracts** — fetches metadata (arXiv / CrossRef / title search) and
+  fills the abstract and any other empty fields, additively.
+
+```
+grimoire backfill --check       # preview: how many entries are missing what
+grimoire backfill               # fetch missing PDFs and abstracts
+grimoire backfill --pdfs-only   # or --abstracts-only
+```
+
+Only **open-access** PDFs are retrievable. Paywalled papers, and publishers that
+block non-browser requests (Wiley, MDPI/Cloudflare, some society journals),
+won't yield a PDF — expect to recover roughly a quarter of a paywall-heavy
+library. Because backfill is idempotent, running it again later picks up entries
+that failed on a transient network error or that become open-access over time.
