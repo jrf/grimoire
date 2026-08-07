@@ -117,7 +117,9 @@ layout = "full"            # full (default), wide, tall, or auto; auto detects w
 Command values accept either a string (`reader = "zathura"`) or an argument array
 (`reader = ["open", "-a", "Preview"]`). Grimoire appends the file path or URL.
 
-Environment variables: `$GRIM_LIBRARY`, `$GRIM_READER`, `$BROWSER`, `$EDITOR`.
+Environment variables: `$GRIM_LIBRARY`, `$GRIM_READER`, `$GRIM_EDITOR` (or
+`$EDITOR`), `$GRIM_BROWSER` (or `$BROWSER`). The `GRIM_`-prefixed names take
+precedence.
 
 ## Helix integration
 

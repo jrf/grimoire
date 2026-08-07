@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One-shot script to import a papis library into carina."""
+"""One-shot script to import a papis library into grimoire."""
 
 import os
 import shutil

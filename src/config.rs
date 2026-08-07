@@ -72,25 +72,34 @@ impl Config {
     }
 
     pub fn editor_command(&self) -> Result<Command> {
-        self.command("EDITOR", self.editor.as_ref(), "vi")
+        self.command(&["GRIM_EDITOR", "EDITOR"], self.editor.as_ref(), "vi")
     }
 
     pub fn reader_command(&self) -> Result<Command> {
-        self.command("GRIM_READER", self.reader.as_ref(), default_opener())
+        self.command(&["GRIM_READER"], self.reader.as_ref(), default_opener())
     }
 
     pub fn browser_command(&self) -> Result<Command> {
-        self.command("BROWSER", self.browser.as_ref(), default_opener())
+        self.command(
+            &["GRIM_BROWSER", "BROWSER"],
+            self.browser.as_ref(),
+            default_opener(),
+        )
     }
 
+    /// Resolve an external command: the first set `env_vars` wins (the
+    /// `GRIM_`-prefixed name takes precedence over the conventional one), then
+    /// the config-file value, then the built-in default.
     fn command(
         &self,
-        environment_variable: &str,
+        env_vars: &[&str],
         configured: Option<&ExternalCommand>,
         default: &str,
     ) -> Result<Command> {
-        if let Ok(program) = std::env::var(environment_variable) {
-            return ExternalCommand::Program(program).build();
+        for var in env_vars {
+            if let Ok(program) = std::env::var(var) {
+                return ExternalCommand::Program(program).build();
+            }
         }
         configured
             .cloned()
