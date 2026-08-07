@@ -35,6 +35,7 @@ grimoire add 1706.03762           # import by arXiv ID (fetches metadata + PDF)
 grimoire add 10.1038/nature14539  # import by DOI (fetches metadata)
 grimoire add paper.pdf            # import local PDF
 grimoire add 1706.03762 2201.1234 # batch import (each input handled independently)
+grimoire add --force 1706.03762   # import even if a matching DOI/title already exists
 grimoire cite --format typst      # pick a reference, output @cite-key
 grimoire export --format yaml     # dump all references to stdout as YAML
 grimoire export --format hayagriva # ...or json / bibtex / hayagriva (Typst)
@@ -141,3 +142,8 @@ l = [":insert-output grimoire cite --format latex", ":redraw"]
 - **DOI** (`10.1038/nature14539`) — fetches metadata from CrossRef
 - **Direct PDF URL** — downloads only when the response contains PDF data
 - **Local PDF** (`paper.pdf`) — extracts metadata from PDF; if filename looks like an arXiv ID, fetches metadata from arXiv
+
+If an incoming reference matches an existing entry by DOI or normalized title,
+`add` warns and skips it; pass `--force` to import anyway. The interactive
+deduplicator (`d` in the TUI) groups existing references that share a title
+**or** DOI so you can merge them after the fact.

@@ -39,6 +39,46 @@ pub fn copy_pdf(source: &Path, dest_dir: &Path) -> Result<String> {
     Ok(filename)
 }
 
+/// Find an existing reference that duplicates `reference`, matching on DOI
+/// first (most reliable) and then on normalized title. Returns the matching
+/// directory and which key matched ("doi" or "title"), or `None`.
+pub fn find_duplicate(
+    library: &Path,
+    reference: &Reference,
+) -> Result<Option<(PathBuf, &'static str)>> {
+    let want_doi = reference
+        .doi
+        .as_deref()
+        .map(|d| d.trim().to_lowercase())
+        .filter(|d| !d.is_empty());
+    let title = reference.title.trim().to_lowercase();
+    let want_title = (!title.is_empty()).then_some(title);
+
+    if want_doi.is_none() && want_title.is_none() {
+        return Ok(None);
+    }
+
+    for dir in list_ref_dirs(library)? {
+        let existing = match crate::metadata::read_info(&dir) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        if let Some(ref doi) = want_doi {
+            let existing_doi = existing.doi.as_deref().map(|d| d.trim().to_lowercase());
+            if existing_doi.as_deref() == Some(doi.as_str()) {
+                return Ok(Some((dir, "doi")));
+            }
+        }
+        if let Some(ref title) = want_title
+            && existing.title.trim().to_lowercase() == *title
+        {
+            return Ok(Some((dir, "title")));
+        }
+    }
+
+    Ok(None)
+}
+
 pub fn list_ref_dirs(library: &Path) -> Result<Vec<PathBuf>> {
     let mut dirs = Vec::new();
     if !library.exists() {

@@ -18,6 +18,7 @@
 
 ## Done
 
+- [x] Duplicate detection: add-time DOI/title skip (`--force` to override) + union-find dedup grouping #bug
 - [x] `grimoire export` command: yaml/json/bibtex/hayagriva, `--tag` filter, `-o` file output #feature
 - [x] Batch `add` (multiple inputs), `--version`, `completions <shell>` subcommand #feature
 - [x] TUI Refined Modal Coexistence: search fallback prompts and seamless Tab/Alt-A toggle between Search and Add modes #improvement
