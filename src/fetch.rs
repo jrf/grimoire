@@ -635,7 +635,9 @@ mod tests {
     #[test]
     fn extracts_doi_embedded_in_a_url() {
         assert_eq!(
-            detect_doi_in_url("https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0123456"),
+            detect_doi_in_url(
+                "https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0123456"
+            ),
             Some("10.1371/journal.pone.0123456".to_string())
         );
         // Encoded slash in the query.
@@ -658,7 +660,10 @@ mod tests {
             Some("35432197".to_string())
         );
         assert_eq!(detect_pmid("PMID: 35432197"), Some("35432197".to_string()));
-        assert_eq!(detect_pmid("https://pmc.ncbi.nlm.nih.gov/articles/PMC123/"), None);
+        assert_eq!(
+            detect_pmid("https://pmc.ncbi.nlm.nih.gov/articles/PMC123/"),
+            None
+        );
         assert_eq!(detect_pmid("just some text"), None);
     }
 
