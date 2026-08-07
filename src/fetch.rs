@@ -83,16 +83,77 @@ pub fn detect_pmc_id(input: &str) -> Option<String> {
 
 pub fn fetch_arxiv(arxiv_id: &str) -> Result<Reference> {
     let id_clean = arxiv_id.trim_end_matches(".pdf");
-    let url = format!("https://export.arxiv.org/api/query?id_list={}", id_clean);
+    match fetch_arxiv_api(id_clean) {
+        Ok(reference) => Ok(reference),
+        Err(api_err) => {
+            // arXiv's export API is frequently slow or rate-limited (and has
+            // been observed to hang entirely for recent IDs). Fall back to the
+            // abs page's citation meta tags, which stay up when the API doesn't.
+            eprintln!("  (arXiv API unavailable: {api_err}; reading the abs page instead)");
+            fetch_arxiv_from_abs(id_clean).with_context(|| {
+                format!("arXiv API failed and the abs-page fallback also failed for {id_clean}")
+            })
+        }
+    }
+}
+
+fn fetch_arxiv_api(id_clean: &str) -> Result<Reference> {
+    let url = format!("https://export.arxiv.org/api/query?id_list={id_clean}");
     let body = http_client()?
         .get(&url)
+        // Shorter than the global timeout so a hung API fails over quickly.
+        .timeout(Duration::from_secs(15))
         .send()
         .context("Failed to reach arXiv API")?
         .error_for_status()
         .context("arXiv API returned an error")?
         .text()?;
-
     parse_arxiv_response(&body, id_clean)
+}
+
+/// Build a Reference from an arXiv abs page's Highwire citation meta tags — the
+/// fallback when the export API is unavailable.
+fn fetch_arxiv_from_abs(id_clean: &str) -> Result<Reference> {
+    let url = format!("https://arxiv.org/abs/{id_clean}");
+    let html = http_client()?
+        .get(&url)
+        .send()
+        .context("Failed to fetch arXiv abs page")?
+        .error_for_status()
+        .context("arXiv abs page returned an error")?
+        .text()?;
+
+    let title = meta_content(&html, "citation_title").context("No title on arXiv abs page")?;
+    let authors = meta_content_all(&html, "citation_author")
+        .iter()
+        .map(|a| flip_family_given(a))
+        .collect();
+    // citation_date is "YYYY/MM/DD" (or "YYYY-MM-DD").
+    let year = meta_content(&html, "citation_date")
+        .and_then(|d| d.split(['/', '-']).next().map(str::to_string))
+        .and_then(|y| y.parse::<u16>().ok());
+    let doi = meta_content(&html, "citation_doi");
+
+    Ok(Reference {
+        title,
+        authors,
+        year,
+        doi,
+        arxiv: Some(id_clean.to_string()),
+        journal: None,
+        tags: vec![],
+        files: vec![],
+        r#abstract: None,
+    })
+}
+
+/// Convert a "Family, Given" author string to "Given Family" so abs-page
+/// authors match the order the export-API path produces.
+fn flip_family_given(name: &str) -> String {
+    match name.split_once(',') {
+        Some((family, given)) => format!("{} {}", given.trim(), family.trim()),
+        None => name.trim().to_string(),
+    }
 }
 
 pub fn download_arxiv_pdf(arxiv_id: &str, dest: &std::path::Path) -> Result<()> {
@@ -632,6 +693,30 @@ fn meta_content(html: &str, name: &str) -> Option<String> {
     None
 }
 
+/// Like `meta_content` but returns every matching tag's content (e.g. the
+/// repeated `citation_author` tags on an arXiv abs page), de-duplicated.
+fn meta_content_all(html: &str, name: &str) -> Vec<String> {
+    let name = regex::escape(name);
+    let patterns = [
+        format!(r#"(?is)<meta[^>]*\bname=["']{name}["'][^>]*\bcontent=["']([^"']*)["']"#),
+        format!(r#"(?is)<meta[^>]*\bcontent=["']([^"']*)["'][^>]*\bname=["']{name}["']"#),
+    ];
+    let mut out: Vec<String> = Vec::new();
+    for pat in patterns {
+        if let Ok(re) = Regex::new(&pat) {
+            for caps in re.captures_iter(html) {
+                if let Some(m) = caps.get(1) {
+                    let val = m.as_str().trim().to_string();
+                    if !val.is_empty() && !out.contains(&val) {
+                        out.push(val);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 fn resolve_relative(base: &str, link: &str) -> String {
     reqwest::Url::parse(base)
         .and_then(|b| b.join(link))
@@ -643,9 +728,31 @@ fn resolve_relative(base: &str, link: &str) -> String {
 mod tests {
     use super::{
         clean_abstract, detect_doi_in_url, detect_doi_url, detect_pmc_id, detect_pmid,
-        extract_pdf_from_oa_package, is_pdf_bytes, meta_content, parse_crossref_pdf_url,
-        parse_csl_item, parse_pmc_doi_response, parse_pmc_oa_package_url,
+        extract_pdf_from_oa_package, flip_family_given, is_pdf_bytes, meta_content,
+        meta_content_all, parse_crossref_pdf_url, parse_csl_item, parse_pmc_doi_response,
+        parse_pmc_oa_package_url,
     };
+
+    #[test]
+    fn reads_repeated_meta_tags_and_flips_author_names() {
+        let html = r#"
+            <meta name="citation_author" content="Mur-Labadia, Lorenzo" />
+            <meta name="citation_author" content="LeCun, Yann" />
+            <meta name="citation_author" content="Ballas, Nicolas" />
+        "#;
+        assert_eq!(
+            meta_content_all(html, "citation_author"),
+            vec!["Mur-Labadia, Lorenzo", "LeCun, Yann", "Ballas, Nicolas"]
+        );
+        assert!(meta_content_all(html, "citation_doi").is_empty());
+
+        assert_eq!(
+            flip_family_given("Mur-Labadia, Lorenzo"),
+            "Lorenzo Mur-Labadia"
+        );
+        assert_eq!(flip_family_given("LeCun, Yann"), "Yann LeCun");
+        assert_eq!(flip_family_given("Madonna"), "Madonna");
+    }
 
     #[test]
     fn strips_leading_abstract_heading() {
