@@ -1894,13 +1894,23 @@ fn draw(f: &mut Frame, app: &mut App) {
                         })
                         .unwrap_or_else(|| "              ".to_string());
 
-                    let title = truncate_ellipsis(&r.title, title_max);
+                    let title_lines = wrap_text(&r.title, title_max);
+                    let indent = " ".repeat(prefix_width.saturating_sub(3)); // minus highlight_symbol
 
-                    ListItem::new(Line::from(vec![
+                    let mut lines: Vec<Line> = Vec::with_capacity(title_lines.len());
+                    lines.push(Line::from(vec![
                         Span::styled(year_str, s_date),
                         Span::styled(author_str, s_author),
-                        Span::styled(title, s_text),
-                    ]))
+                        Span::styled(title_lines[0].clone(), s_text),
+                    ]));
+                    for cont in &title_lines[1..] {
+                        lines.push(Line::from(vec![
+                            Span::raw(indent.clone()),
+                            Span::styled(cont.clone(), s_text),
+                        ]));
+                    }
+
+                    ListItem::new(lines)
                 })
                 .collect();
 
@@ -2361,6 +2371,47 @@ fn truncate_ellipsis(s: &str, max: usize) -> String {
         let end = s.floor_char_boundary(max - 1);
         format!("{}…", &s[..end])
     }
+}
+
+/// Word-wrap `s` to lines no wider than `width` columns. Splits on whitespace;
+/// a single word longer than `width` is hard-broken at char boundaries. Returns
+/// at least one line (empty input yields one empty line).
+fn wrap_text(s: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![s.to_string()];
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0usize;
+
+    for word in s.split_whitespace() {
+        let mut word = word;
+        // Hard-break any word that can't fit on its own line.
+        while word.chars().count() > width {
+            if current_width > 0 {
+                lines.push(std::mem::take(&mut current));
+                current_width = 0;
+            }
+            let end = word.floor_char_boundary(width);
+            lines.push(word[..end].to_string());
+            word = &word[end..];
+        }
+        let word_width = word.chars().count();
+        if current_width == 0 {
+            current.push_str(word);
+            current_width = word_width;
+        } else if current_width + 1 + word_width <= width {
+            current.push(' ');
+            current.push_str(word);
+            current_width += 1 + word_width;
+        } else {
+            lines.push(std::mem::take(&mut current));
+            current.push_str(word);
+            current_width = word_width;
+        }
+    }
+    lines.push(current);
+    lines
 }
 
 // --- Dedup TUI ---
