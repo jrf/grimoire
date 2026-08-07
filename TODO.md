@@ -4,6 +4,7 @@
 
 - [ ] Manage references: delete (CLI `rm` + TUI key), confirmation prompts on destructive actions, dedup *merge* (not just trash), `.trash` restore/empty #feature
 - [ ] Wire the FTS index into TUI search so filtering matches abstract, tags, journal, DOI, and PDF full text (currently indexed but unused) #improvement
+- [ ] PMC OA PDF download is broken: the `ftp://…/oa_package/…` mirror now 404s over http(s) and the per-article PDF endpoint sits behind a JS interstitial — `add <PMC…>` can no longer fetch the PDF. Needs a new source or a browser-grade fetch #bug
 
 ## Next
 
@@ -25,6 +26,8 @@
 
 ## Done
 
+- [x] `grimoire backfill`: fill missing PDFs (Unpaywall repo-first → CrossRef) and abstracts for existing entries; `--pdfs-only`/`--abstracts-only`/`--check`, additive-only #feature
+- [x] Wrap long titles in the browse list instead of truncating; drop the `>` selection arrow (background highlight suffices) #improvement
 - [x] Import coverage: publisher landing pages (`citation_*` meta tags), PubMed/PMID, and DOI-embedded-in-URL #feature
 - [x] Robustness: network timeouts, atomic `info.toml` writes, resilient `validate`, enrich race fix, editor-crash guard #bug
 - [x] Duplicate detection: add-time DOI/title skip (`--force` to override) + union-find dedup grouping (`d`) #bug

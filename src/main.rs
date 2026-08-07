@@ -1,4 +1,6 @@
+mod backfill;
 mod config;
+mod enrich;
 mod export;
 mod fetch;
 mod index;
@@ -56,6 +58,18 @@ enum Command {
         #[arg(short, long)]
         tag: Vec<String>,
     },
+    /// Fetch missing PDFs and abstracts for existing entries (open-access only)
+    Backfill {
+        /// Only download missing PDFs (skip abstract/metadata fetches)
+        #[arg(long, conflicts_with = "abstracts_only")]
+        pdfs_only: bool,
+        /// Only fetch missing abstracts (skip PDF downloads)
+        #[arg(long)]
+        abstracts_only: bool,
+        /// Report what would be attempted without changing anything
+        #[arg(long)]
+        check: bool,
+    },
     /// Rebuild the search index from filesystem
     Reindex,
     /// Validate library integrity (missing PDFs, junk files, temp names)
@@ -92,6 +106,18 @@ fn main() -> Result<()> {
             output,
             tag,
         }) => export::run(&library, &format, output.as_deref(), &tag),
+        Some(Command::Backfill {
+            pdfs_only,
+            abstracts_only,
+            check,
+        }) => backfill::run(
+            &library,
+            &backfill::Options {
+                pdfs: !abstracts_only,
+                abstracts: !pdfs_only,
+                check,
+            },
+        ),
         Some(Command::Reindex) => cmd_reindex(&library),
         Some(Command::Validate { fix }) => validate::run(&library, fix),
         Some(Command::Completions { shell }) => {

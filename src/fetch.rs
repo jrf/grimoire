@@ -617,6 +617,81 @@ pub fn fetch_pubmed(pmid: &str) -> Result<Reference> {
     Ok(reference)
 }
 
+/// Download an open-access PDF for a DOI when no landing page is available to
+/// scrape, returning the bytes and a short human label for the source. Tries,
+/// in order of how reliably each downloads without a subscription:
+///
+/// 1. **Unpaywall repository copies** — green OA in institutional/subject
+///    repositories, which rarely bot-block. This is the workhorse.
+/// 2. **Unpaywall publisher copies** — gold OA on the publisher's site; works
+///    for e.g. PLoS/Frontiers but often 403s behind Wiley/MDPI/Cloudflare.
+/// 3. **CrossRef** `link` — any PDF URL the work lists.
+///
+/// (PubMed Central is intentionally not used here: its OA-package mirror now
+/// 404s and its per-article PDF endpoint is behind a JS interstitial, so
+/// neither is scriptable without a full browser.)
+///
+/// Returns `None` when every source fails.
+pub fn fetch_pdf_for_doi(doi: &str) -> Option<(Vec<u8>, String)> {
+    for url in unpaywall_pdf_candidates(doi) {
+        if let Ok(bytes) = download_pdf(&url) {
+            return Some((bytes, "Unpaywall".to_string()));
+        }
+    }
+
+    if let Ok(body) = fetch_crossref_body(doi)
+        && let Ok(Some(url)) = parse_crossref_pdf_url(&body)
+        && let Ok(bytes) = download_pdf(&url)
+    {
+        return Some((bytes, "CrossRef".to_string()));
+    }
+
+    None
+}
+
+/// All `url_for_pdf` links Unpaywall lists for a DOI, repository copies first
+/// (they rarely bot-block) then publisher copies, deduplicated and upgraded to
+/// https. Empty when there is no free full text.
+fn unpaywall_pdf_candidates(doi: &str) -> Vec<String> {
+    let url = format!(
+        "https://api.unpaywall.org/v2/{}?email=jrfetzer@gmail.com",
+        urlencoding::encode(doi)
+    );
+    let Some(body) = http_client()
+        .ok()
+        .and_then(|c| c.get(&url).send().ok())
+        .and_then(|r| r.error_for_status().ok())
+        .and_then(|r| r.text().ok())
+    else {
+        return Vec::new();
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) else {
+        return Vec::new();
+    };
+
+    let mut repository = Vec::new();
+    let mut publisher = Vec::new();
+    if let Some(locations) = v["oa_locations"].as_array() {
+        for loc in locations {
+            let Some(pdf) = loc["url_for_pdf"].as_str() else {
+                continue;
+            };
+            let pdf = pdf
+                .strip_prefix("http://")
+                .map(|rest| format!("https://{rest}"))
+                .unwrap_or_else(|| pdf.to_string());
+            if loc["host_type"].as_str() == Some("repository") {
+                repository.push(pdf);
+            } else {
+                publisher.push(pdf);
+            }
+        }
+    }
+    repository.append(&mut publisher);
+    repository.dedup();
+    repository
+}
+
 /// Look up an open-access PDF URL for a DOI via Unpaywall. Best-effort: any
 /// network/parse error or absence of free full text yields `None`.
 pub fn unpaywall_pdf_url(doi: &str) -> Option<String> {
