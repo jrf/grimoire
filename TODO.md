@@ -39,7 +39,7 @@
 - [x] PDF full-text indexing into FTS5 on `reindex` and `add` #feature
 - [x] URL import: `grimoire add <url>` downloads a PDF and imports #feature
 - [x] Native TUI: nucleo + ratatui for browse and cite (replaced fzf) #feature
-- [x] Theme system: built-in themes + custom TOML themes, configurable via config.toml #feature
+- [x] Theme system: external TOML themes, configurable via config.toml #feature
 - [x] Helix integration: `grimoire cite` via `:insert-output` using `/dev/tty` #improvement
 - [x] Ad-hoc codesign on `just install` to prevent macOS SIGKILL #chore
 - [x] Project scaffold: `cargo init`, dependencies, module structure #chore

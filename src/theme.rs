@@ -1,8 +1,9 @@
 use ratatui::style::Color;
 use serde::Deserialize;
 use std::collections::BTreeMap;
+use std::path::Path;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Theme {
     pub text: Color,
     pub text_dim: Color,
@@ -20,22 +21,24 @@ pub struct Theme {
     pub status_fg: Color,
 }
 
-fn default_theme() -> Theme {
-    Theme {
-        text: Color::Rgb(200, 211, 245),        // #c8d3f5 — fg
-        text_dim: Color::Rgb(130, 139, 184),    // #828bb8 — fg_dark
-        text_muted: Color::Rgb(59, 66, 97),     // #3b4261 — fg_gutter
-        author: Color::Rgb(192, 153, 255),      // #c099ff — magenta
-        highlight: Color::Rgb(255, 199, 119),   // #ffc777 — yellow
-        link: Color::Rgb(130, 170, 255),        // #82aaff — blue
-        date: Color::Rgb(195, 232, 141),        // #c3e88d — green
-        border: Color::Rgb(59, 66, 97),         // #3b4261 — fg_gutter
-        selection: Color::Rgb(47, 51, 77),      // #2f334d — bg_highlight
-        popup_bg: Color::Rgb(30, 32, 48),       // #1e2030 — ui.popup bg
-        popup_border: Color::Rgb(88, 158, 215), // #589ed7 — border_highlight
-        normal_bg: Color::Rgb(130, 170, 255),   // #82aaff — blue
-        insert_bg: Color::Rgb(195, 232, 141),   // #c3e88d — green
-        status_fg: Color::Rgb(27, 29, 43),      // #1b1d2b — black
+impl Default for Theme {
+    fn default() -> Self {
+        Self {
+            text: Color::Reset,
+            text_dim: Color::Reset,
+            text_muted: Color::Reset,
+            author: Color::Reset,
+            highlight: Color::Reset,
+            link: Color::Reset,
+            date: Color::Reset,
+            border: Color::Reset,
+            selection: Color::Reset,
+            popup_bg: Color::Reset,
+            popup_border: Color::Reset,
+            normal_bg: Color::Reset,
+            insert_bg: Color::Reset,
+            status_fg: Color::Reset,
+        }
     }
 }
 
@@ -112,13 +115,19 @@ impl ThemeConfig {
 }
 
 pub fn load_theme(config_theme: Option<&str>) -> Theme {
-    let name = config_theme.unwrap_or("tokyo-night-moon");
-    let base = default_theme();
-
     let theme_dir = dirs::config_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join("grimoire")
         .join("themes");
+
+    load_theme_from_dir(&theme_dir, config_theme)
+}
+
+fn load_theme_from_dir(theme_dir: &Path, config_theme: Option<&str>) -> Theme {
+    let base = Theme::default();
+    let Some(name) = config_theme else {
+        return base;
+    };
 
     let theme_file = theme_dir.join(format!("{}.toml", name));
     if let Ok(contents) = std::fs::read_to_string(&theme_file)
@@ -128,4 +137,58 @@ pub fn load_theme(config_theme: Option<&str>) -> Theme {
     }
 
     base
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Theme, load_theme_from_dir};
+    use ratatui::style::Color;
+
+    #[test]
+    fn no_configured_theme_uses_terminal_colors() {
+        let theme_dir = tempfile::tempdir().unwrap();
+
+        assert_eq!(
+            load_theme_from_dir(theme_dir.path(), None),
+            Theme::default()
+        );
+    }
+
+    #[test]
+    fn selected_theme_is_loaded_from_the_config_directory() {
+        let theme_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            theme_dir.path().join("synthetic.toml"),
+            r##"
+[colors]
+foreground = "#123456"
+accent = "#abcdef"
+
+[ui]
+text = "foreground"
+highlight = "accent"
+"##,
+        )
+        .unwrap();
+
+        let theme = load_theme_from_dir(theme_dir.path(), Some("synthetic"));
+        assert_eq!(theme.text, Color::Rgb(0x12, 0x34, 0x56));
+        assert_eq!(theme.highlight, Color::Rgb(0xab, 0xcd, 0xef));
+        assert_eq!(theme.author, Color::Reset);
+    }
+
+    #[test]
+    fn missing_or_invalid_theme_uses_terminal_colors() {
+        let theme_dir = tempfile::tempdir().unwrap();
+        std::fs::write(theme_dir.path().join("invalid.toml"), "not toml").unwrap();
+
+        assert_eq!(
+            load_theme_from_dir(theme_dir.path(), Some("missing")),
+            Theme::default()
+        );
+        assert_eq!(
+            load_theme_from_dir(theme_dir.path(), Some("invalid")),
+            Theme::default()
+        );
+    }
 }

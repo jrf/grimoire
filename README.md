@@ -113,9 +113,14 @@ library = "~/Papers"       # default
 editor = ["hx"]             # string or command plus arguments; defaults to $EDITOR or "vi"
 reader = ["open"]           # PDF opener; defaults to $GRIM_READER or the OS opener
 browser = ["open"]          # URL opener; defaults to $BROWSER or the OS opener
-theme = "tokyo-night-moon" # default
+theme = "tokyo-night-moon" # loads themes/tokyo-night-moon.toml from the config directory
 layout = "full"            # full (default), wide, tall, or auto; auto detects wide/tall
 ```
+
+Themes are loaded exclusively from `~/.config/grimoire/themes/<name>.toml`;
+color palettes are not embedded in the binary. The files in [`themes/`](themes/)
+are examples that can be copied into that directory. If `theme` is unset or its
+file cannot be loaded, Grimoire uses the terminal's default colors.
 
 Command values accept either a string (`reader = "zathura"`) or an argument array
 (`reader = ["open", "-a", "Preview"]`). Grimoire appends the file path or URL.
