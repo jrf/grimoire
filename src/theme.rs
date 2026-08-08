@@ -5,6 +5,7 @@ use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Theme {
+    pub background: Color,
     pub text: Color,
     pub text_dim: Color,
     pub text_muted: Color,
@@ -24,6 +25,7 @@ pub struct Theme {
 impl Default for Theme {
     fn default() -> Self {
         Self {
+            background: Color::Reset,
             text: Color::Reset,
             text_dim: Color::Reset,
             text_muted: Color::Reset,
@@ -52,6 +54,7 @@ pub struct ThemeConfig {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct UiConfig {
+    pub background: Option<String>,
     pub text: Option<String>,
     pub text_dim: Option<String>,
     pub text_muted: Option<String>,
@@ -105,6 +108,7 @@ impl ThemeConfig {
         });
 
         Theme {
+            background: r(ui.map(|u| &u.background), &["bg"], base.background),
             text: r(ui.map(|u| &u.text), &["fg", "text"], base.text),
             text_dim: r(
                 ui.map(|u| &u.text_dim),
@@ -306,6 +310,7 @@ highlight = "accent"
         let config: ThemeConfig = toml::from_str(
             r##"
 [colors]
+bg = "#1a1b26"
 fg = "#cdd6f4"
 comment = "#6c7086"
 mauve = "#cba6f7"
@@ -320,6 +325,7 @@ crust = "#11111b"
         .unwrap();
         let theme = config.resolve(&Theme::default());
 
+        assert_eq!(theme.background, Color::Rgb(0x1a, 0x1b, 0x26));
         assert_eq!(theme.text, Color::Rgb(0xcd, 0xd6, 0xf4));
         assert_eq!(theme.author, Color::Rgb(0xcb, 0xa6, 0xf7));
         assert_eq!(theme.selection, Color::Rgb(0x45, 0x47, 0x5a));
@@ -343,5 +349,23 @@ cursor_bg = "bg_highlight"
 
         let theme = config.resolve(&Theme::default());
         assert_eq!(theme.selection, Color::Rgb(0x2f, 0x33, 0x4d));
+    }
+
+    #[test]
+    fn explicit_background_takes_precedence_over_shared_palette_name() {
+        let config: ThemeConfig = toml::from_str(
+            r##"
+[colors]
+bg = "#111111"
+surface = "#222222"
+
+[ui]
+background = "surface"
+"##,
+        )
+        .unwrap();
+
+        let theme = config.resolve(&Theme::default());
+        assert_eq!(theme.background, Color::Rgb(0x22, 0x22, 0x22));
     }
 }

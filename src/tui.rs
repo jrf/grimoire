@@ -1632,6 +1632,10 @@ fn draw(f: &mut Frame, app: &mut App) {
     let s_date = Style::default().fg(t.date);
 
     let area = f.area();
+    f.render_widget(
+        Block::default().style(Style::default().bg(t.background)),
+        area,
+    );
     // The full-screen preview overlay (drilled into from FullList) overrides
     // whatever layout is otherwise in effect.
     let resolved = if app.preview_overlay {
