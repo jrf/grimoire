@@ -124,6 +124,8 @@ apply to the current session only and never rewrite `config.toml`; edit `theme`
 directly to change the startup theme. The files in
 [`themes/`](themes/) are examples. If `theme` is unset or its file cannot be
 loaded, Grimoire uses the terminal's default colors.
+The palette's `bg` color fills the interface background; `[ui].background` can
+name a different palette color when needed.
 
 Command values accept either a string (`reader = "zathura"`) or an argument array
 (`reader = ["open", "-a", "Preview"]`). Grimoire appends the file path or URL.
