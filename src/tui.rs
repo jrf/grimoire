@@ -12,7 +12,7 @@ use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
@@ -1621,6 +1621,25 @@ fn is_importable(input: &str) -> bool {
     false
 }
 
+fn picker_rect(area: Rect) -> Rect {
+    let width = if area.width > 4 {
+        (area.width * 3 / 4).max(50).min(area.width - 4)
+    } else {
+        area.width.max(1)
+    };
+    let height = if area.height > 4 {
+        (area.height * 3 / 4).max(6).min(area.height - 2)
+    } else {
+        area.height.max(1)
+    };
+    Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    )
+}
+
 fn draw(f: &mut Frame, app: &mut App) {
     let t = &app.theme;
     let s_text = Style::default().fg(t.text);
@@ -2009,12 +2028,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     // Theme picker popup
     if let Some(ref popup) = app.theme_popup {
         let area = f.area();
-        let max_visible = 12.min(popup.names.len());
-        let height = max_visible as u16 + 3;
-        let width = 30.min(area.width.saturating_sub(4));
-        let x = area.width.saturating_sub(width) / 2;
-        let y = area.height.saturating_sub(height) / 2;
-        let popup_area = ratatui::layout::Rect::new(x, y, width, height);
+        let popup_area = picker_rect(area);
 
         f.render_widget(Clear, popup_area);
 
@@ -2030,6 +2044,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         let popup_chunks =
             Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
 
+        let max_visible = usize::from(popup_chunks[0].height).max(1);
         let scroll = popup.selected.saturating_sub(max_visible.saturating_sub(1));
 
         let lines: Vec<Line> = popup
@@ -2775,7 +2790,15 @@ fn draw_dedup(
 
 #[cfg(test)]
 mod tests {
-    use super::LayoutMode;
+    use super::{LayoutMode, picker_rect};
+    use ratatui::layout::Rect;
+
+    #[test]
+    fn picker_uses_pdfterm_three_quarter_layout() {
+        let area = Rect::new(0, 0, 100, 40);
+
+        assert_eq!(picker_rect(area), Rect::new(12, 5, 75, 30));
+    }
 
     #[test]
     fn layout_defaults_to_full() {
