@@ -216,29 +216,18 @@ impl TagPopup {
 
 struct ThemePopup {
     names: Vec<String>,
+    paths: Vec<String>,
     selected: usize,
 }
 
 impl ThemePopup {
-    fn new() -> Self {
-        let mut names = vec!["default".to_string()];
-        let theme_dir = dirs::config_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join("grimoire")
-            .join("themes");
-        if let Ok(entries) = std::fs::read_dir(&theme_dir) {
-            let mut configured_names: Vec<_> = entries
-                .flatten()
-                .filter_map(|e| {
-                    let name = e.file_name().to_string_lossy().to_string();
-                    name.strip_suffix(".toml").map(|s| s.to_string())
-                })
-                .filter(|name| name != "default")
-                .collect();
-            configured_names.sort();
-            names.extend(configured_names);
+    fn new(catalog_path: Option<&str>) -> Self {
+        let (names, paths) = theme::catalog_entries(catalog_path).into_iter().unzip();
+        Self {
+            names,
+            paths,
+            selected: 0,
         }
-        Self { names, selected: 0 }
     }
 
     fn move_up(&mut self) {
@@ -251,8 +240,8 @@ impl ThemePopup {
         }
     }
 
-    fn selected_name(&self) -> Option<&str> {
-        self.names.get(self.selected).map(|s| s.as_str())
+    fn selected_path(&self) -> Option<&str> {
+        self.paths.get(self.selected).map(String::as_str)
     }
 }
 
@@ -606,16 +595,14 @@ fn run_event_loop(terminal: &mut Term, app: &mut App, tty_ctl: &mut File) -> Res
                     }
                     KeyCode::Up | KeyCode::Char('k') => {
                         app.theme_popup.as_mut().unwrap().move_up();
-                        if let Some(name) = app.theme_popup.as_ref().unwrap().selected_name() {
-                            let theme_name = if name == "default" { None } else { Some(name) };
-                            app.theme = theme::load_theme(theme_name);
+                        if let Some(path) = app.theme_popup.as_ref().unwrap().selected_path() {
+                            app.theme = theme::load_theme(Some(path));
                         }
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
                         app.theme_popup.as_mut().unwrap().move_down();
-                        if let Some(name) = app.theme_popup.as_ref().unwrap().selected_name() {
-                            let theme_name = if name == "default" { None } else { Some(name) };
-                            app.theme = theme::load_theme(theme_name);
+                        if let Some(path) = app.theme_popup.as_ref().unwrap().selected_path() {
+                            app.theme = theme::load_theme(Some(path));
                         }
                     }
                     KeyCode::Enter => {
@@ -710,7 +697,8 @@ fn run_event_loop(terminal: &mut Term, app: &mut App, tty_ctl: &mut File) -> Res
                             Some(TagPopup::new(&app.all_tags, &app.entries, &app.tag_filter));
                     }
                     (KeyCode::Char('T'), KeyModifiers::SHIFT | KeyModifiers::NONE) => {
-                        app.theme_popup = Some(ThemePopup::new());
+                        app.theme_popup =
+                            Some(ThemePopup::new(app.config.theme_catalog.as_deref()));
                     }
                     (KeyCode::Char('L'), KeyModifiers::SHIFT | KeyModifiers::NONE) => {
                         app.preview_overlay = false;
@@ -2038,7 +2026,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         let popup_chunks =
             Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
 
-        let scroll = popup.selected.saturating_sub(max_visible - 1);
+        let scroll = popup.selected.saturating_sub(max_visible.saturating_sub(1));
 
         let lines: Vec<Line> = popup
             .names

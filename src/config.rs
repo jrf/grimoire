@@ -37,6 +37,7 @@ pub struct Config {
     pub reader: Option<ExternalCommand>,
     pub browser: Option<ExternalCommand>,
     pub theme: Option<String>,
+    pub theme_catalog: Option<String>,
     pub layout: Option<String>,
 }
 
@@ -53,6 +54,7 @@ impl Config {
                 reader: None,
                 browser: None,
                 theme: None,
+                theme_catalog: None,
                 layout: None,
             })
         }
