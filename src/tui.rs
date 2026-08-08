@@ -221,20 +221,22 @@ struct ThemePopup {
 
 impl ThemePopup {
     fn new() -> Self {
-        let mut names = Vec::new();
+        let mut names = vec!["default".to_string()];
         let theme_dir = dirs::config_dir()
             .unwrap_or_else(|| std::path::PathBuf::from("."))
             .join("grimoire")
             .join("themes");
         if let Ok(entries) = std::fs::read_dir(&theme_dir) {
-            names = entries
+            let mut configured_names: Vec<_> = entries
                 .flatten()
                 .filter_map(|e| {
                     let name = e.file_name().to_string_lossy().to_string();
                     name.strip_suffix(".toml").map(|s| s.to_string())
                 })
+                .filter(|name| name != "default")
                 .collect();
-            names.sort();
+            configured_names.sort();
+            names.extend(configured_names);
         }
         Self { names, selected: 0 }
     }
