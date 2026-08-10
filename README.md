@@ -2,7 +2,7 @@
 
 A fast TUI reference manager.
 
-![Grimoire paper browser](grimoire-paper-browser.png)
+![Grimoire paper browser](assets/grimoire-paper-browser.png)
 
 ## Install
 
