@@ -85,8 +85,8 @@ enum Command {
         #[arg(required = true)]
         query: Vec<String>,
         /// Maximum number of passages to return
-        #[arg(short, long, default_value_t = 10)]
-        limit: usize,
+        #[arg(short, long)]
+        limit: Option<usize>,
     },
     /// Validate library integrity (missing PDFs, junk files, temp names)
     Validate {

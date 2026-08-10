@@ -141,8 +141,8 @@ impl Config {
         )
     }
 
-    pub fn semantic_results(&self) -> usize {
-        self.semantic_results.unwrap_or(10).max(1)
+    pub fn semantic_results(&self) -> Option<usize> {
+        self.semantic_results.filter(|limit| *limit > 0)
     }
 
     /// Resolve an external command: the first set `env_vars` wins (the
@@ -220,14 +220,14 @@ mod tests {
     }
 
     #[test]
-    fn semantic_result_count_defaults_and_never_reaches_zero() {
+    fn semantic_result_count_defaults_to_all() {
         let default: Config = toml::from_str("").unwrap();
         let configured: Config = toml::from_str("semantic_results = 25").unwrap();
         let zero: Config = toml::from_str("semantic_results = 0").unwrap();
 
-        assert_eq!(default.semantic_results(), 10);
-        assert_eq!(configured.semantic_results(), 25);
-        assert_eq!(zero.semantic_results(), 1);
+        assert_eq!(default.semantic_results(), None);
+        assert_eq!(configured.semantic_results(), Some(25));
+        assert_eq!(zero.semantic_results(), None);
     }
 
     #[test]

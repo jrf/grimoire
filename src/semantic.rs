@@ -208,7 +208,7 @@ fn embedding_progress_line(
 pub fn search(
     library: &Path,
     query: &str,
-    limit: usize,
+    limit: Option<usize>,
     config: &EmbeddingConfig,
 ) -> Result<Vec<SearchHit>> {
     search_inner(library, query, limit, config, true)
@@ -217,7 +217,7 @@ pub fn search(
 pub fn search_silent(
     library: &Path,
     query: &str,
-    limit: usize,
+    limit: Option<usize>,
     config: &EmbeddingConfig,
 ) -> Result<Vec<SearchHit>> {
     search_inner(library, query, limit, config, false)
@@ -226,14 +226,17 @@ pub fn search_silent(
 fn search_inner(
     library: &Path,
     query: &str,
-    limit: usize,
+    limit: Option<usize>,
     config: &EmbeddingConfig,
     show_download_progress: bool,
 ) -> Result<Vec<SearchHit>> {
     validate_embedding_config(config)?;
     let query = query.trim();
     anyhow::ensure!(!query.is_empty(), "Semantic query cannot be empty");
-    anyhow::ensure!(limit > 0, "Semantic search limit must be greater than zero");
+    anyhow::ensure!(
+        limit.is_none_or(|limit| limit > 0),
+        "Semantic search limit must be greater than zero"
+    );
 
     let conn = Connection::open(library.join(".grimoire.db"))?;
     let (stored_model_id, dimension, count) = index_metadata(&conn)?;
@@ -267,7 +270,7 @@ fn search_inner(
 pub fn search_and_print(
     library: &Path,
     query: &str,
-    limit: usize,
+    limit: Option<usize>,
     config: &EmbeddingConfig,
 ) -> Result<()> {
     let hits = search(library, query, limit, config)?;
@@ -1046,7 +1049,7 @@ fn semantic_meta(conn: &Connection, key: &str) -> Option<String> {
 fn similarity_search(
     conn: &Connection,
     query_embedding: &[f32],
-    limit: usize,
+    limit: Option<usize>,
 ) -> Result<Vec<SearchHit>> {
     let mut statement = conn.prepare(
         "SELECT dir_name, paper_title, source_path, chunk_index, text, headings, pages, embedding
@@ -1087,7 +1090,9 @@ fn similarity_search(
     }
 
     chunks.sort_by(|left, right| right.similarity.total_cmp(&left.similarity));
-    chunks.truncate(limit.min(chunks.len()));
+    if let Some(limit) = limit {
+        chunks.truncate(limit.min(chunks.len()));
+    }
     Ok(chunks)
 }
 
@@ -1295,9 +1300,13 @@ mod tests {
         )
         .unwrap();
 
-        let hits = similarity_search(&conn, &[1.0, 0.0], 2).unwrap();
+        let hits = similarity_search(&conn, &[1.0, 0.0], Some(2)).unwrap();
         assert_eq!(hits[0].paper_title, "Closest vector");
         assert!(hits[0].similarity >= hits[1].similarity);
+        assert_eq!(
+            similarity_search(&conn, &[1.0, 0.0], None).unwrap().len(),
+            2
+        );
     }
 
     #[test]

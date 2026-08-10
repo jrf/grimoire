@@ -737,7 +737,8 @@ fn run_event_loop(terminal: &mut Term, app: &mut App, tty_ctl: &mut File) -> Res
                     }
                     (KeyCode::Char('c'), KeyModifiers::CONTROL) => app.should_quit = true,
 
-                    (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
+                    (KeyCode::Char('v'), KeyModifiers::NONE)
+                    | (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
                         app.semantic_input = Some(
                             app.semantic_view
                                 .as_ref()
@@ -1942,7 +1943,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     };
 
     let search_title = if app.semantic_input.is_some() || app.semantic_view.is_some() {
-        Line::from(Span::styled(" Semantic ", s_hl))
+        Line::from(Span::styled(" Semantic Search ", s_hl))
     } else if app.add_input.is_some() {
         Line::from(Span::styled(" Add ", s_hl))
     } else {
@@ -1972,7 +1973,7 @@ fn draw(f: &mut Frame, app: &mut App) {
 
     // Status bar as bottom title of list
     let count_str = if let Some(view) = &app.semantic_view {
-        format!(" {}/{} ", view.results.len(), app.config.semantic_results())
+        format!(" {} results ", view.results.len())
     } else {
         format!(" {}/{} ", app.filtered_indices.len(), app.entries.len())
     };
@@ -2019,7 +2020,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     let mode_hint = if app.semantic_input.is_some() {
         " enter search  esc cancel "
     } else if app.semantic_view.is_some() {
-        " enter open  ^s edit  esc papers "
+        " enter open  v edit  esc papers "
     } else if app.add_input.is_some() {
         " enter add  esc cancel "
     } else {
@@ -2512,7 +2513,7 @@ fn draw(f: &mut Frame, app: &mut App) {
             ("^f / ^b", "Page down / up"),
             ("J / K", "Scroll preview down / up"),
             ("/ or i", "Enter search mode"),
-            ("^s", "Semantic passage search"),
+            ("v", "Semantic passage search"),
             ("enter", "Open PDF"),
             ("space", "Toggle full-screen abstract"),
             ("e", "Edit info.toml"),
@@ -2544,7 +2545,7 @@ fn draw(f: &mut Frame, app: &mut App) {
             ("j / k", "Move through ranked passages"),
             ("enter", "Open PDF at result page"),
             ("space", "Toggle full passage preview"),
-            ("^s", "Edit semantic query"),
+            ("v", "Edit semantic query"),
             ("esc", "Return to papers"),
         ];
 

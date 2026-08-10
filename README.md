@@ -59,7 +59,7 @@ grimoire completions fish         # emit a shell completion script
 | `j / k` | Move down / up |
 | `g / G` | Jump to top / bottom |
 | `/ or i` | Enter search mode |
-| `ctrl-s` | Search indexed passages semantically |
+| `v` | Search indexed passages semantically |
 | `enter` | Open PDF (browse), confirm search (search) |
 | `e` | Edit info.toml |
 | `y` | Copy BibTeX |
@@ -120,7 +120,7 @@ browser = ["open"]          # URL opener; defaults to $BROWSER or the OS opener
 theme = "~/.config/themes/tokyo-night-moon.toml"
 theme_catalog = "~/.config/themes/catalog.toml"
 layout = "full"            # full (default), wide, tall, or auto; auto detects wide/tall
-semantic_results = 10       # ranked passages shown by TUI semantic search
+# semantic_results = 25     # optional cap; omitted or zero returns all passages
 ```
 
 `theme` is loaded directly. `theme_catalog` contains an explicit `themes = [...]`
@@ -194,9 +194,11 @@ metadata.
 Embeddings use a pinned, Q4 ONNX export of Google's on-device EmbeddingGemma
 300M model. The model is downloaded on first use and cached locally; document
 text is not sent to an embedding API. Run `grimoire semantic "your
-natural-language query"` to print ranked results, or press `ctrl-s` in the TUI
-to browse the configured top `semantic_results` passages with headings and page
-numbers. Re-run `semantic-index` after regenerating the JSONL files; unchanged
+natural-language query"` to print ranked results, or press `v` in the TUI
+to browse all ranked passages with headings and page numbers. Set
+`semantic_results` to a positive number only if you want to cap TUI results;
+the CLI similarly accepts an optional `--limit`. Re-run `semantic-index` after
+regenerating the JSONL files; unchanged
 sources are skipped automatically. Changing the embedding profile triggers a
 complete rebuild even without `--force`. Model
 downloads honor `HF_ENDPOINT` and the standard `SSL_CERT_FILE`,
