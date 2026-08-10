@@ -2750,13 +2750,18 @@ fn draw_semantic_preview(f: &mut Frame, hit: &SearchHit, area: Rect, scroll: u16
     lines.extend(
         semantic_passage_lines(&hit.text, &hit.headings)
             .into_iter()
-            .map(|line| Line::from(Span::styled(line, s.dim))),
+            .map(|line| Line::from(Span::styled(line, s.text))),
     );
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        format!("{} · chunk {}", hit.source_path, hit.chunk_index),
-        s.muted,
-    )));
+    lines.push(Line::from(vec![
+        Span::styled(hit.source_path.as_str(), s.link),
+        Span::styled(" · ", s.dim),
+        Span::styled("chunk ", s.text),
+        Span::styled(
+            hit.chunk_index.to_string(),
+            s.highlight.add_modifier(Modifier::BOLD),
+        ),
+    ]));
 
     f.render_widget(
         Paragraph::new(lines)
@@ -2806,6 +2811,7 @@ fn draw_preview(f: &mut Frame, app: &App, area: ratatui::layout::Rect, s: &Style
         )));
 
         if r.year.is_some() || r.journal.is_some() {
+            lines.push(Line::from(""));
             let mut parts = Vec::new();
             if let Some(year) = r.year {
                 parts.push(Span::styled(year.to_string(), s_date));
@@ -2840,15 +2846,18 @@ fn draw_preview(f: &mut Frame, app: &App, area: ratatui::layout::Rect, s: &Style
             ]));
         }
         if !r.tags.is_empty() {
+            if r.doi.is_some() || r.arxiv.is_some() {
+                lines.push(Line::from(""));
+            }
             lines.push(Line::from(vec![
-                Span::styled("tags  ", s_muted),
+                Span::styled("tags  ", s_dim),
                 Span::styled(r.tags.join(", "), s_hl),
             ]));
         }
 
         if let Some(ref abs) = r.r#abstract {
             lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(abs.as_str(), s_dim)));
+            lines.push(Line::from(Span::styled(abs.as_str(), s_text)));
         }
 
         f.render_widget(
