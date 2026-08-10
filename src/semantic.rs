@@ -68,7 +68,7 @@ pub struct IndexSummary {
     pub up_to_date: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SearchHit {
     pub dir_name: String,
     pub paper_title: String,
@@ -82,14 +82,22 @@ pub struct SearchHit {
 
 pub const DEFAULT_PAGE_SIZE: usize = 100;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct RankedChunk {
     id: i64,
+    dir_name: String,
     similarity: f32,
 }
 
 #[derive(Debug)]
 pub struct SearchRanking {
+    chunks: Vec<RankedChunk>,
+    papers: Vec<RankedPaper>,
+}
+
+#[derive(Debug)]
+struct RankedPaper {
+    dir_name: String,
     chunks: Vec<RankedChunk>,
 }
 
@@ -102,9 +110,32 @@ pub struct SearchPage {
     pub next_offset: Option<usize>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct PaperSearchHit {
+    pub dir_name: String,
+    pub paper_title: String,
+    pub similarity: f32,
+    pub matching_passages: usize,
+    pub passages: Vec<SearchHit>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PaperSearchPage {
+    pub hits: Vec<PaperSearchHit>,
+    pub total: usize,
+    pub total_passages: usize,
+    pub offset: usize,
+    pub returned: usize,
+    pub next_offset: Option<usize>,
+}
+
 impl SearchRanking {
     pub fn total(&self) -> usize {
         self.chunks.len()
+    }
+
+    pub fn paper_total(&self) -> usize {
+        self.papers.len()
     }
 
     pub fn page(&self, library: &Path, offset: usize, limit: usize) -> Result<SearchPage> {
@@ -115,32 +146,7 @@ impl SearchRanking {
             self.chunks.len()
         );
         let end = offset.saturating_add(limit).min(self.chunks.len());
-        let conn = Connection::open(library.join(".grimoire.db"))?;
-        let mut statement = conn.prepare(
-            "SELECT dir_name, paper_title, source_path, chunk_index, text, headings, pages
-             FROM semantic_chunk WHERE id = ?1",
-        )?;
-        let mut hits = Vec::with_capacity(end.saturating_sub(offset));
-        for ranked in &self.chunks[offset..end] {
-            let hit = statement.query_row([ranked.id], |row| {
-                Ok(SearchHit {
-                    dir_name: row.get(0)?,
-                    paper_title: row.get(1)?,
-                    source_path: row.get(2)?,
-                    chunk_index: row.get(3)?,
-                    text: row.get(4)?,
-                    headings: row
-                        .get::<_, String>(5)?
-                        .lines()
-                        .filter(|heading| !heading.is_empty())
-                        .map(str::to_string)
-                        .collect(),
-                    pages: serde_json::from_str(&row.get::<_, String>(6)?).unwrap_or_default(),
-                    similarity: ranked.similarity,
-                })
-            })?;
-            hits.push(hit);
-        }
+        let hits = hydrate_hits(library, &self.chunks[offset..end])?;
         let returned = hits.len();
         Ok(SearchPage {
             hits,
@@ -150,6 +156,126 @@ impl SearchRanking {
             next_offset: (end < self.chunks.len()).then_some(end),
         })
     }
+
+    pub fn paper_page(
+        &self,
+        library: &Path,
+        offset: usize,
+        limit: usize,
+        per_paper: usize,
+    ) -> Result<PaperSearchPage> {
+        anyhow::ensure!(limit > 0, "Semantic search limit must be greater than zero");
+        anyhow::ensure!(
+            per_paper > 0,
+            "Semantic passages per paper must be greater than zero"
+        );
+        anyhow::ensure!(
+            offset <= self.papers.len(),
+            "Semantic search offset {offset} exceeds {} papers",
+            self.papers.len()
+        );
+        let end = offset.saturating_add(limit).min(self.papers.len());
+        let conn = Connection::open(library.join(".grimoire.db"))?;
+        let mut statement = conn.prepare(
+            "SELECT dir_name, paper_title, source_path, chunk_index, text, headings, pages
+             FROM semantic_chunk WHERE id = ?1",
+        )?;
+        let mut hits = Vec::with_capacity(end.saturating_sub(offset));
+        for ranked in &self.papers[offset..end] {
+            let passages = hydrate_ranked_hits(
+                &mut statement,
+                &ranked.chunks[..per_paper.min(ranked.chunks.len())],
+            )?;
+            let best = passages
+                .first()
+                .context("Ranked paper has no semantic passages")?;
+            hits.push(PaperSearchHit {
+                dir_name: ranked.dir_name.clone(),
+                paper_title: best.paper_title.clone(),
+                similarity: best.similarity,
+                matching_passages: ranked.chunks.len(),
+                passages,
+            });
+        }
+        let returned = hits.len();
+        Ok(PaperSearchPage {
+            hits,
+            total: self.papers.len(),
+            total_passages: self.chunks.len(),
+            offset,
+            returned,
+            next_offset: (end < self.papers.len()).then_some(end),
+        })
+    }
+
+    pub fn paper_passage_page(
+        &self,
+        library: &Path,
+        dir_name: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<SearchPage> {
+        anyhow::ensure!(limit > 0, "Semantic search limit must be greater than zero");
+        let paper = self
+            .papers
+            .iter()
+            .find(|paper| paper.dir_name == dir_name)
+            .with_context(|| format!("Paper {dir_name:?} is not in the semantic results"))?;
+        anyhow::ensure!(
+            offset <= paper.chunks.len(),
+            "Semantic search offset {offset} exceeds {} passages for this paper",
+            paper.chunks.len()
+        );
+        let end = offset.saturating_add(limit).min(paper.chunks.len());
+        let hits = hydrate_hits(library, &paper.chunks[offset..end])?;
+        let returned = hits.len();
+        Ok(SearchPage {
+            hits,
+            total: paper.chunks.len(),
+            offset,
+            returned,
+            next_offset: (end < paper.chunks.len()).then_some(end),
+        })
+    }
+}
+
+fn hydrate_hits(library: &Path, chunks: &[RankedChunk]) -> Result<Vec<SearchHit>> {
+    let conn = Connection::open(library.join(".grimoire.db"))?;
+    let mut statement = conn.prepare(
+        "SELECT dir_name, paper_title, source_path, chunk_index, text, headings, pages
+         FROM semantic_chunk WHERE id = ?1",
+    )?;
+    hydrate_ranked_hits(&mut statement, chunks)
+}
+
+fn hydrate_ranked_hits(
+    statement: &mut rusqlite::Statement<'_>,
+    chunks: &[RankedChunk],
+) -> Result<Vec<SearchHit>> {
+    chunks
+        .iter()
+        .map(|ranked| {
+            statement
+                .query_row([ranked.id], |row| {
+                    Ok(SearchHit {
+                        dir_name: row.get(0)?,
+                        paper_title: row.get(1)?,
+                        source_path: row.get(2)?,
+                        chunk_index: row.get(3)?,
+                        text: row.get(4)?,
+                        headings: row
+                            .get::<_, String>(5)?
+                            .lines()
+                            .filter(|heading| !heading.is_empty())
+                            .map(str::to_string)
+                            .collect(),
+                        pages: serde_json::from_str(&row.get::<_, String>(6)?).unwrap_or_default(),
+                        similarity: ranked.similarity,
+                    })
+                })
+                .map_err(Into::into)
+        })
+        .collect()
 }
 
 pub fn build(
@@ -404,6 +530,53 @@ pub fn print_page(page: &SearchPage) {
         }
         println!("   {}", passage_preview(&hit.text, 280));
         println!("   [{} · chunk {}]", hit.source_path, hit.chunk_index);
+    }
+}
+
+pub fn print_paper_page(page: &PaperSearchPage) {
+    if page.hits.is_empty() {
+        println!("No semantic matches.");
+        return;
+    }
+
+    for (position, paper) in page.hits.iter().enumerate() {
+        println!(
+            "{}. {:.3}  {} · {} matching passage{}",
+            page.offset + position + 1,
+            paper.similarity,
+            paper.paper_title,
+            paper.matching_passages,
+            if paper.matching_passages == 1 {
+                ""
+            } else {
+                "s"
+            }
+        );
+        for (match_index, hit) in paper.passages.iter().enumerate() {
+            let location = match hit.pages.as_slice() {
+                [] => String::new(),
+                [page] => format!(" · p. {page}"),
+                pages => format!(
+                    " · pp. {}",
+                    pages
+                        .iter()
+                        .map(u32::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            };
+            let label = if paper.passages.len() == 1 {
+                "best match".to_string()
+            } else {
+                format!("match {}", match_index + 1)
+            };
+            println!("   {label}: {:.3}{location}", hit.similarity);
+            if !hit.headings.is_empty() {
+                println!("   {}", hit.headings.join(" › "));
+            }
+            println!("   {}", passage_preview(&hit.text, 280));
+            println!("   [{} · chunk {}]", hit.source_path, hit.chunk_index);
+        }
     }
 }
 
@@ -1146,21 +1319,42 @@ fn semantic_meta(conn: &Connection, key: &str) -> Option<String> {
 }
 
 fn similarity_ranking(conn: &Connection, query_embedding: &[f32]) -> Result<SearchRanking> {
-    let mut statement = conn.prepare("SELECT id, embedding FROM semantic_chunk")?;
+    let mut statement = conn.prepare("SELECT id, dir_name, embedding FROM semantic_chunk")?;
     let rows = statement.query_map([], |row| {
-        Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Vec<u8>>(2)?,
+        ))
     })?;
 
     let mut chunks = Vec::new();
     for row in rows {
-        let (id, bytes) = row?;
+        let (id, dir_name, bytes) = row?;
         let embedding = decode_embedding(&bytes)?;
         let similarity = cosine_similarity(query_embedding, &embedding)?;
-        chunks.push(RankedChunk { id, similarity });
+        chunks.push(RankedChunk {
+            id,
+            dir_name,
+            similarity,
+        });
     }
 
     chunks.sort_by(|left, right| right.similarity.total_cmp(&left.similarity));
-    Ok(SearchRanking { chunks })
+    let mut paper_positions: HashMap<String, usize> = HashMap::new();
+    let mut papers: Vec<RankedPaper> = Vec::new();
+    for chunk in &chunks {
+        if let Some(&position) = paper_positions.get(&chunk.dir_name) {
+            papers[position].chunks.push(chunk.clone());
+        } else {
+            paper_positions.insert(chunk.dir_name.clone(), papers.len());
+            papers.push(RankedPaper {
+                dir_name: chunk.dir_name.clone(),
+                chunks: vec![chunk.clone()],
+            });
+        }
+    }
+    Ok(SearchRanking { chunks, papers })
 }
 
 fn encode_embedding(embedding: &[f32]) -> Vec<u8> {
@@ -1369,6 +1563,7 @@ mod tests {
 
         let ranking = similarity_ranking(&conn, &[1.0, 0.0]).unwrap();
         assert_eq!(ranking.total(), 2);
+        assert_eq!(ranking.paper_total(), 1);
         let first = ranking.page(library.path(), 0, 1).unwrap();
         assert_eq!(first.hits[0].paper_title, "Closest vector");
         assert_eq!(first.total, 2);
@@ -1377,6 +1572,52 @@ mod tests {
         let second = ranking.page(library.path(), 1, 1).unwrap();
         assert!(first.hits[0].similarity >= second.hits[0].similarity);
         assert_eq!(second.next_offset, None);
+    }
+
+    #[test]
+    fn search_groups_papers_by_their_best_ranked_passage() {
+        let library = tempfile::tempdir().unwrap();
+        let mut first = synthetic_source("paper-a/derived/chunks.jsonl", "first");
+        first.chunks[0].dir_name = "paper-a".to_string();
+        first.chunks[0].paper_title = "Paper A".to_string();
+        let mut second_chunk = synthetic_chunk("Paper A", "A second passage", 1);
+        second_chunk.dir_name = "paper-a".to_string();
+        second_chunk.source_path = first.source_path.clone();
+        first.chunks.push(second_chunk);
+
+        let mut second = synthetic_source("paper-b/derived/chunks.jsonl", "second");
+        second.chunks[0].dir_name = "paper-b".to_string();
+        second.chunks[0].paper_title = "Paper B".to_string();
+
+        let conn = open_index(library.path()).unwrap();
+        replace_index(
+            &conn,
+            &[first, second],
+            &[vec![1.0, 0.0], vec![0.8, 0.6], vec![0.9, 0.435_889_9]],
+            2,
+            "synthetic-model",
+        )
+        .unwrap();
+
+        let ranking = similarity_ranking(&conn, &[1.0, 0.0]).unwrap();
+        assert_eq!(ranking.total(), 3);
+        assert_eq!(ranking.paper_total(), 2);
+
+        let papers = ranking.paper_page(library.path(), 0, 2, 1).unwrap();
+        assert_eq!(papers.total, 2);
+        assert_eq!(papers.total_passages, 3);
+        assert_eq!(papers.hits[0].paper_title, "Paper A");
+        assert_eq!(papers.hits[0].matching_passages, 2);
+        assert_eq!(papers.hits[0].passages.len(), 1);
+        assert_eq!(papers.hits[1].paper_title, "Paper B");
+        assert!(papers.hits[0].similarity > papers.hits[1].similarity);
+
+        let passages = ranking
+            .paper_passage_page(library.path(), "paper-a", 0, 10)
+            .unwrap();
+        assert_eq!(passages.total, 2);
+        assert_eq!(passages.hits.len(), 2);
+        assert!(passages.hits[0].similarity > passages.hits[1].similarity);
     }
 
     #[test]
