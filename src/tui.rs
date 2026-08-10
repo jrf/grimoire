@@ -125,7 +125,10 @@ enum SemanticResults {
 #[derive(Clone)]
 enum SemanticScope {
     Papers,
-    AllPassages,
+    AllPassages {
+        paper_index: usize,
+        paper_loaded: usize,
+    },
     PaperPassages {
         dir_name: String,
         paper_index: usize,
@@ -157,7 +160,7 @@ impl SemanticScope {
     fn label(&self) -> &'static str {
         match self {
             Self::Papers => "papers",
-            Self::AllPassages | Self::PaperPassages { .. } => "passages",
+            Self::AllPassages { .. } | Self::PaperPassages { .. } => "passages",
         }
     }
 
@@ -796,7 +799,7 @@ fn run_event_loop(terminal: &mut Term, app: &mut App, tty_ctl: &mut File) -> Res
                             .as_ref()
                             .is_some_and(|view| view.scope.is_expanded()) =>
                     {
-                        app.collapse_semantic_paper();
+                        app.return_to_semantic_papers();
                     }
                     (KeyCode::Esc, _) if app.semantic_view.is_some() => {
                         app.clear_semantic();
@@ -817,7 +820,10 @@ fn run_event_loop(terminal: &mut Term, app: &mut App, tty_ctl: &mut File) -> Res
                     }
 
                     (KeyCode::Char('p'), KeyModifiers::NONE) if app.semantic_view.is_some() => {
-                        app.toggle_semantic_scope();
+                        app.toggle_selected_semantic_paper();
+                    }
+                    (KeyCode::Char('P'), _) if app.semantic_view.is_some() => {
+                        app.toggle_all_semantic_passages();
                     }
                     (KeyCode::Char('l'), KeyModifiers::NONE) | (KeyCode::Right, _)
                         if app.semantic_view.is_some() =>
@@ -827,7 +833,7 @@ fn run_event_loop(terminal: &mut Term, app: &mut App, tty_ctl: &mut File) -> Res
                     (KeyCode::Char('h'), KeyModifiers::NONE) | (KeyCode::Left, _)
                         if app.semantic_view.is_some() =>
                     {
-                        app.collapse_semantic_paper();
+                        app.return_to_semantic_papers();
                     }
 
                     (KeyCode::Char('/'), KeyModifiers::NONE)
@@ -1149,7 +1155,7 @@ impl App {
                 (SemanticScope::Papers, SemanticResults::Papers(results)) => ranking
                     .paper_page(&library, offset, page_size, 1)
                     .map(|page| results.extend(page.hits)),
-                (SemanticScope::AllPassages, SemanticResults::Passages(results)) => ranking
+                (SemanticScope::AllPassages { .. }, SemanticResults::Passages(results)) => ranking
                     .page(&library, offset, page_size)
                     .map(|page| results.extend(page.hits)),
                 (
@@ -1169,7 +1175,7 @@ impl App {
         }
     }
 
-    fn toggle_semantic_scope(&mut self) {
+    fn show_all_semantic_passages(&mut self) {
         let library = self.config.library_dir();
         let cap = self.config.semantic_results();
         let result: Result<()> = (|| {
@@ -1181,39 +1187,62 @@ impl App {
                 .ranking
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("Semantic ranking is still loading"))?;
-            match &view.scope {
+            let (paper_index, paper_loaded) = match &view.scope {
                 SemanticScope::Papers => {
-                    let total = cap.map_or_else(|| ranking.total(), |cap| cap.min(ranking.total()));
-                    let page_size = semantic::DEFAULT_PAGE_SIZE.min(total).max(1);
-                    let page = ranking.page(&library, 0, page_size)?;
-                    view.results = SemanticResults::Passages(page.hits);
-                    view.scope = SemanticScope::AllPassages;
-                    view.total = total;
+                    (view.list_state.selected().unwrap_or(0), view.results.len())
                 }
-                SemanticScope::AllPassages | SemanticScope::PaperPassages { .. } => {
-                    let total = cap.map_or_else(
-                        || ranking.paper_total(),
-                        |cap| cap.min(ranking.paper_total()),
-                    );
-                    let page_size = semantic::DEFAULT_PAGE_SIZE.min(total).max(1);
-                    let page = ranking.paper_page(&library, 0, page_size, 1)?;
-                    view.results = SemanticResults::Papers(page.hits);
-                    view.scope = SemanticScope::Papers;
-                    view.total = total;
-                }
-            }
+                SemanticScope::PaperPassages {
+                    paper_index,
+                    paper_loaded,
+                    ..
+                } => (*paper_index, *paper_loaded),
+                SemanticScope::AllPassages { .. } => return Ok(()),
+            };
+            let total = cap.map_or_else(|| ranking.total(), |cap| cap.min(ranking.total()));
+            let page_size = semantic::DEFAULT_PAGE_SIZE.min(total).max(1);
+            let page = ranking.page(&library, 0, page_size)?;
+            view.results = SemanticResults::Passages(page.hits);
+            view.scope = SemanticScope::AllPassages {
+                paper_index,
+                paper_loaded,
+            };
+            view.total = total;
             view.list_state
                 .select((!view.results.is_empty()).then_some(0));
             Ok(())
         })();
         if let Err(error) = result {
             self.flash = Some((
-                format!("Could not switch semantic result view: {error}"),
+                format!("Could not load all semantic passages: {error}"),
                 std::time::Instant::now(),
             ));
         }
         self.preview_overlay = false;
         self.preview_scroll = 0;
+    }
+
+    fn toggle_all_semantic_passages(&mut self) {
+        if self
+            .semantic_view
+            .as_ref()
+            .is_some_and(|view| matches!(&view.scope, SemanticScope::AllPassages { .. }))
+        {
+            self.return_to_semantic_papers();
+        } else {
+            self.show_all_semantic_passages();
+        }
+    }
+
+    fn toggle_selected_semantic_paper(&mut self) {
+        if self
+            .semantic_view
+            .as_ref()
+            .is_some_and(|view| matches!(&view.scope, SemanticScope::PaperPassages { .. }))
+        {
+            self.return_to_semantic_papers();
+        } else {
+            self.expand_selected_semantic_paper();
+        }
     }
 
     fn expand_selected_semantic_paper(&mut self) {
@@ -1268,18 +1297,22 @@ impl App {
         self.preview_scroll = 0;
     }
 
-    fn collapse_semantic_paper(&mut self) -> bool {
+    fn return_to_semantic_papers(&mut self) -> bool {
         let library = self.config.library_dir();
         let Some(view) = self.semantic_view.as_mut() else {
             return false;
         };
-        let SemanticScope::PaperPassages {
-            paper_index,
-            paper_loaded,
-            ..
-        } = view.scope.clone()
-        else {
-            return false;
+        let (paper_index, paper_loaded) = match view.scope.clone() {
+            SemanticScope::PaperPassages {
+                paper_index,
+                paper_loaded,
+                ..
+            }
+            | SemanticScope::AllPassages {
+                paper_index,
+                paper_loaded,
+            } => (paper_index, paper_loaded),
+            SemanticScope::Papers => return false,
         };
         let Some(ranking) = view.ranking.as_ref() else {
             return false;
@@ -2331,18 +2364,20 @@ fn draw(f: &mut Frame, app: &mut App) {
     {
         match &view.scope {
             SemanticScope::Papers => bottom_spans.extend([
-                Span::styled(" l", s_link.add_modifier(Modifier::BOLD)),
-                Span::styled(" matches  ", s_text),
-                Span::styled("p", s_author.add_modifier(Modifier::BOLD)),
+                Span::styled(" p", s_link.add_modifier(Modifier::BOLD)),
+                Span::styled(" passages  ", s_text),
+                Span::styled("P", s_author.add_modifier(Modifier::BOLD)),
                 Span::styled(" all passages  ", s_text),
             ]),
-            SemanticScope::AllPassages => bottom_spans.extend([
-                Span::styled(" p", s_author.add_modifier(Modifier::BOLD)),
+            SemanticScope::AllPassages { .. } => bottom_spans.extend([
+                Span::styled(" P", s_author.add_modifier(Modifier::BOLD)),
                 Span::styled(" papers  ", s_text),
             ]),
             SemanticScope::PaperPassages { .. } => bottom_spans.extend([
-                Span::styled(" h", s_link.add_modifier(Modifier::BOLD)),
+                Span::styled(" p", s_link.add_modifier(Modifier::BOLD)),
                 Span::styled(" papers  ", s_text),
+                Span::styled("P", s_author.add_modifier(Modifier::BOLD)),
+                Span::styled(" all passages  ", s_text),
             ]),
         }
         bottom_spans.extend([
@@ -2481,7 +2516,7 @@ fn draw(f: &mut Frame, app: &mut App) {
                                 Line::from(vec![
                                     Span::styled(
                                         format!(
-                                            "  {} matching passage{}",
+                                            "  {} passage{} ›",
                                             paper.matching_passages,
                                             if paper.matching_passages == 1 {
                                                 ""

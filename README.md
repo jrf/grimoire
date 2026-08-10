@@ -93,11 +93,13 @@ grimoire completions fish         # emit a shell completion script
 | `q` | Quit |
 
 Semantic results start as one row per paper, ordered by that paper's strongest
-matching passage. `l` or Right opens the selected paper's ranked passages;
-`h`, Left, or `esc` returns to the grouped results. Press `p` to toggle between
-grouped papers and the global raw-passage ranking. In either view, `j / k`
-moves, `space` expands the selected match, `enter` opens its PDF at the indexed
-page, and `v` starts another semantic query.
+matching passage. Lowercase `p` toggles between the selected paper and its
+ranked passages; `l` or Right also opens them. Uppercase `P` toggles between
+grouped papers and the global raw-passage ranking. From either passage view,
+`h` or Left returns to the grouped paper results; `esc` also returns from a
+selected paper's passages. In every view, `j / k` moves, `space` expands the
+selected match, `enter` opens its PDF at the indexed page, and `v` starts
+another semantic query.
 
 ## Agentic CLI
 
@@ -253,12 +255,14 @@ natural-language query"` to rank papers by their strongest passage. Add
 `--per-paper 3` to include more evidence per paper, or `--group passages` to
 return the original global passage ranking.
 
-The TUI uses the same paper-first ranking. Press `v` to search, `l` or Right to
-open a paper's ranked passages, `h` or Left to return, and `p` to toggle the raw
-passage ranking. Set `semantic_results` to a positive number only if you want to
-cap results in either TUI view. It hydrates 100 papers or passages initially and
-automatically loads another page near the end; its status names the active unit
-and reports loaded and total counts.
+The TUI uses the same paper-first ranking. Press `v` to search; lowercase `p`
+toggles between a paper and its ranked passages, while uppercase `P` toggles
+between grouped papers and the global raw-passage ranking. `l` or Right also
+opens a paper, and `h` or Left returns from either passage view. Set
+`semantic_results` to a positive number only if you want to cap results in any
+TUI view. It hydrates 100 papers or passages initially and automatically loads
+another page near the end; its status names the active unit and reports loaded
+and total counts.
 
 The CLI returns 100 papers by default, accepts `--limit` and `--offset` for
 paging, and requires `--all` for an intentionally unbounded response. Grouped
