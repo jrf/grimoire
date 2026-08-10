@@ -6,6 +6,7 @@ mod fetch;
 mod index;
 mod metadata;
 mod model;
+mod semantic;
 mod storage;
 mod theme;
 mod tui;
@@ -72,6 +73,21 @@ enum Command {
     },
     /// Rebuild the search index from filesystem
     Reindex,
+    /// Build a local vector index from JSONL files under each paper's derived directory
+    SemanticIndex {
+        /// Re-embed every passage even when its source is unchanged
+        #[arg(long)]
+        force: bool,
+    },
+    /// Search indexed passages by semantic similarity
+    Semantic {
+        /// Natural-language search query
+        #[arg(required = true)]
+        query: Vec<String>,
+        /// Maximum number of passages to return
+        #[arg(short, long)]
+        limit: Option<usize>,
+    },
     /// Validate library integrity (missing PDFs, junk files, temp names)
     Validate {
         /// Automatically fix issues (rename temp files, remove non-PDFs)
@@ -119,6 +135,12 @@ fn main() -> Result<()> {
             },
         ),
         Some(Command::Reindex) => cmd_reindex(&library),
+        Some(Command::SemanticIndex { force }) => {
+            semantic::build(&library, &config.embedding, force)
+        }
+        Some(Command::Semantic { query, limit }) => {
+            semantic::search_and_print(&library, &query.join(" "), limit, &config.embedding)
+        }
         Some(Command::Validate { fix }) => validate::run(&library, fix),
         Some(Command::Completions { shell }) => {
             let mut cmd = Cli::command();

@@ -22,6 +22,7 @@ use crate::config::Config as AppConfig;
 use crate::index;
 use crate::metadata;
 use crate::model::Reference;
+use crate::semantic::{self, SearchHit};
 use crate::storage;
 use crate::theme::{self, Theme};
 use crate::validate;
@@ -96,6 +97,15 @@ pub struct App {
     /// Flip the current sort field away from its default direction (`S` key).
     sort_reverse: bool,
     validate_popup: Option<ValidatePopup>,
+    semantic_input: Option<String>,
+    semantic_view: Option<SemanticView>,
+    semantic_rx: Option<mpsc::Receiver<std::result::Result<Vec<SearchHit>, String>>>,
+}
+
+struct SemanticView {
+    query: String,
+    results: Vec<SearchHit>,
+    list_state: ListState,
 }
 
 struct ValidatePopup {
@@ -427,7 +437,35 @@ fn run_event_loop(terminal: &mut Term, app: &mut App, tty_ctl: &mut File) -> Res
             }
         }
 
-        let timeout = if app.flash.is_some() || app.enrich_rx.is_some() {
+        if let Some(ref rx) = app.semantic_rx {
+            match rx.try_recv() {
+                Ok(Ok(results)) => {
+                    app.semantic_rx = None;
+                    if let Some(view) = app.semantic_view.as_mut() {
+                        view.results = results;
+                        view.list_state
+                            .select((!view.results.is_empty()).then_some(0));
+                    }
+                    app.preview_scroll = 0;
+                    continue;
+                }
+                Ok(Err(error)) => {
+                    app.semantic_rx = None;
+                    app.flash = Some((error, std::time::Instant::now()));
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    app.semantic_rx = None;
+                    app.flash = Some((
+                        "Semantic search failed".to_string(),
+                        std::time::Instant::now(),
+                    ));
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+
+        let timeout = if app.flash.is_some() || app.enrich_rx.is_some() || app.semantic_rx.is_some()
+        {
             std::time::Duration::from_millis(100)
         } else {
             std::time::Duration::from_secs(60)
@@ -463,6 +501,26 @@ fn run_event_loop(terminal: &mut Term, app: &mut App, tty_ctl: &mut File) -> Res
                     }
                     KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         vp.scroll = vp.scroll.saturating_sub(10);
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+
+            if app.semantic_input.is_some() {
+                match (key.code, key.modifiers) {
+                    (KeyCode::Esc, _) => app.semantic_input = None,
+                    (KeyCode::Char('c'), KeyModifiers::CONTROL) => app.should_quit = true,
+                    (KeyCode::Enter, _) => app.submit_semantic(),
+                    (KeyCode::Backspace, _) => {
+                        if let Some(input) = app.semantic_input.as_mut() {
+                            input.pop();
+                        }
+                    }
+                    (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                        if let Some(input) = app.semantic_input.as_mut() {
+                            input.push(c);
+                        }
                     }
                     _ => {}
                 }
@@ -618,6 +676,12 @@ fn run_event_loop(terminal: &mut Term, app: &mut App, tty_ctl: &mut File) -> Res
                     (KeyCode::Esc, _) => {
                         app.input_mode = InputMode::Browse;
                     }
+                    (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
+                        app.semantic_input = Some(app.filter.clone());
+                        app.filter.clear();
+                        app.rebuild_filter();
+                        app.input_mode = InputMode::Browse;
+                    }
                     (KeyCode::Char('c'), KeyModifiers::CONTROL) => app.should_quit = true,
 
                     (KeyCode::Char('a'), KeyModifiers::ALT)
@@ -665,13 +729,27 @@ fn run_event_loop(terminal: &mut Term, app: &mut App, tty_ctl: &mut File) -> Res
                     (KeyCode::Esc, _) if app.preview_overlay => {
                         app.preview_overlay = false;
                     }
+                    (KeyCode::Esc, _) if app.semantic_view.is_some() => {
+                        app.clear_semantic();
+                    }
                     (KeyCode::Esc, _) | (KeyCode::Char('q'), KeyModifiers::NONE) => {
                         app.should_quit = true;
                     }
                     (KeyCode::Char('c'), KeyModifiers::CONTROL) => app.should_quit = true,
 
+                    (KeyCode::Char('v'), KeyModifiers::NONE)
+                    | (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
+                        app.semantic_input = Some(
+                            app.semantic_view
+                                .as_ref()
+                                .map(|view| view.query.clone())
+                                .unwrap_or_default(),
+                        );
+                    }
+
                     (KeyCode::Char('/'), KeyModifiers::NONE)
                     | (KeyCode::Char('i'), KeyModifiers::NONE) => {
+                        app.clear_semantic();
                         app.input_mode = InputMode::Search;
                     }
 
@@ -710,6 +788,7 @@ fn run_event_loop(terminal: &mut Term, app: &mut App, tty_ctl: &mut File) -> Res
                         ));
                     }
                     (KeyCode::Char('c'), KeyModifiers::NONE) => {
+                        app.clear_semantic();
                         app.filter.clear();
                         app.tag_filter = None;
                         app.rebuild_filter();
@@ -754,13 +833,15 @@ fn run_event_loop(terminal: &mut Term, app: &mut App, tty_ctl: &mut File) -> Res
                     (KeyCode::Char('V'), KeyModifiers::SHIFT | KeyModifiers::NONE) => {
                         app.action_validate();
                     }
-                    (KeyCode::Char('s'), KeyModifiers::NONE) if app.filter.is_empty() => {
+                    (KeyCode::Char('s'), KeyModifiers::NONE)
+                        if app.filter.is_empty() && app.semantic_view.is_none() =>
+                    {
                         app.sort_mode = app.sort_mode.next();
                         app.sort_reverse = false;
                         app.rebuild_filter();
                     }
                     (KeyCode::Char('S'), KeyModifiers::SHIFT | KeyModifiers::NONE)
-                        if app.filter.is_empty() =>
+                        if app.filter.is_empty() && app.semantic_view.is_none() =>
                     {
                         app.sort_reverse = !app.sort_reverse;
                         app.rebuild_filter();
@@ -861,6 +942,9 @@ impl App {
             sort_mode: SortMode::Name,
             sort_reverse: false,
             validate_popup: None,
+            semantic_input: None,
+            semantic_view: None,
+            semantic_rx: None,
         };
 
         if !app.filter.is_empty() {
@@ -909,6 +993,48 @@ impl App {
         } else {
             self.list_state.select(Some(0));
         }
+        self.preview_scroll = 0;
+    }
+
+    fn submit_semantic(&mut self) {
+        let Some(input) = self.semantic_input.take() else {
+            return;
+        };
+        let query = input.trim().to_string();
+        if query.is_empty() {
+            self.flash = Some((
+                "Semantic query cannot be empty".to_string(),
+                std::time::Instant::now(),
+            ));
+            return;
+        }
+
+        let library = self.config.library_dir();
+        let limit = self.config.semantic_results();
+        let embedding = self.config.embedding.clone();
+        let worker_query = query.clone();
+        let (tx, rx) = mpsc::channel();
+        self.semantic_rx = Some(rx);
+        self.semantic_view = Some(SemanticView {
+            query,
+            results: Vec::new(),
+            list_state: ListState::default(),
+        });
+        self.preview_overlay = false;
+        self.preview_scroll = 0;
+
+        std::thread::spawn(move || {
+            let result = semantic::search_silent(&library, &worker_query, limit, &embedding)
+                .map_err(|error| semantic_error_message(&error));
+            let _ = tx.send(result);
+        });
+    }
+
+    fn clear_semantic(&mut self) {
+        self.semantic_input = None;
+        self.semantic_view = None;
+        self.semantic_rx = None;
+        self.preview_overlay = false;
         self.preview_scroll = 0;
     }
 
@@ -965,12 +1091,29 @@ impl App {
     }
 
     fn selected_entry(&self) -> Option<&Entry> {
+        if let Some(hit) = self.selected_semantic_hit() {
+            return self
+                .entries
+                .iter()
+                .find(|entry| entry.dir_name == hit.dir_name);
+        }
         let selected = self.list_state.selected()?;
         let &idx = self.filtered_indices.get(selected)?;
         self.entries.get(idx)
     }
 
+    fn selected_semantic_hit(&self) -> Option<&SearchHit> {
+        let view = self.semantic_view.as_ref()?;
+        view.results.get(view.list_state.selected()?)
+    }
+
     fn move_up(&mut self) {
+        if let Some(view) = self.semantic_view.as_mut() {
+            let selected = view.list_state.selected().unwrap_or(0);
+            view.list_state.select(Some(selected.saturating_sub(1)));
+            self.preview_scroll = 0;
+            return;
+        }
         if self.filtered_indices.is_empty() {
             return;
         }
@@ -983,6 +1126,15 @@ impl App {
     }
 
     fn move_down(&mut self) {
+        if let Some(view) = self.semantic_view.as_mut() {
+            if !view.results.is_empty() {
+                let selected = view.list_state.selected().unwrap_or(0);
+                view.list_state
+                    .select(Some((selected + 1).min(view.results.len() - 1)));
+            }
+            self.preview_scroll = 0;
+            return;
+        }
         if self.filtered_indices.is_empty() {
             return;
         }
@@ -996,6 +1148,12 @@ impl App {
     }
 
     fn scroll_up(&mut self, lines: usize) {
+        if let Some(view) = self.semantic_view.as_mut() {
+            let selected = view.list_state.selected().unwrap_or(0);
+            view.list_state.select(Some(selected.saturating_sub(lines)));
+            self.preview_scroll = 0;
+            return;
+        }
         if self.filtered_indices.is_empty() {
             return;
         }
@@ -1005,6 +1163,15 @@ impl App {
     }
 
     fn scroll_down(&mut self, lines: usize) {
+        if let Some(view) = self.semantic_view.as_mut() {
+            if !view.results.is_empty() {
+                let selected = view.list_state.selected().unwrap_or(0);
+                view.list_state
+                    .select(Some((selected + lines).min(view.results.len() - 1)));
+            }
+            self.preview_scroll = 0;
+            return;
+        }
         if self.filtered_indices.is_empty() {
             return;
         }
@@ -1031,6 +1198,12 @@ impl App {
     }
 
     fn move_to_top(&mut self) {
+        if let Some(view) = self.semantic_view.as_mut() {
+            view.list_state
+                .select((!view.results.is_empty()).then_some(0));
+            self.preview_scroll = 0;
+            return;
+        }
         if !self.filtered_indices.is_empty() {
             self.list_state.select(Some(0));
             self.preview_scroll = 0;
@@ -1038,6 +1211,12 @@ impl App {
     }
 
     fn move_to_bottom(&mut self) {
+        if let Some(view) = self.semantic_view.as_mut() {
+            view.list_state
+                .select((!view.results.is_empty()).then_some(view.results.len() - 1));
+            self.preview_scroll = 0;
+            return;
+        }
         if !self.filtered_indices.is_empty() {
             self.list_state
                 .select(Some(self.filtered_indices.len() - 1));
@@ -1046,6 +1225,9 @@ impl App {
     }
 
     fn action_select(&mut self) -> Result<()> {
+        let semantic_page = self
+            .selected_semantic_hit()
+            .and_then(|hit| hit.pages.first().copied());
         let entry = match self.selected_entry() {
             Some(e) => e,
             None => return Ok(()),
@@ -1069,7 +1251,8 @@ impl App {
                         .map(|e| e.path())
                 };
                 match pdf {
-                    Some(p) => match launch_detached(self.config.reader_command(), &p) {
+                    Some(p) => match launch_reader(self.config.reader_command(), &p, semantic_page)
+                    {
                         Ok(_) => {}
                         Err(e) => {
                             self.flash = Some((
@@ -1483,6 +1666,15 @@ impl App {
     }
 }
 
+fn semantic_error_message(error: &anyhow::Error) -> String {
+    let detail = format!("{error:#}");
+    if detail.contains("Semantic index uses model") {
+        "Semantic index was built with an older model; run `grimoire semantic-index`".to_string()
+    } else {
+        format!("Semantic search: {detail}")
+    }
+}
+
 fn spawn_detached(cmd: &mut std::process::Command) -> std::io::Result<std::process::Child> {
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -1497,6 +1689,38 @@ fn launch_detached<T: AsRef<std::ffi::OsStr>>(
     let mut command = command?;
     command.arg(target);
     Ok(spawn_detached(&mut command)?)
+}
+
+fn launch_reader(
+    command: Result<std::process::Command>,
+    target: &Path,
+    page: Option<u32>,
+) -> Result<std::process::Child> {
+    let mut command = prepare_reader_command(command?, target, page);
+    Ok(spawn_detached(&mut command)?)
+}
+
+fn prepare_reader_command(
+    command: std::process::Command,
+    target: &Path,
+    page: Option<u32>,
+) -> std::process::Command {
+    let mut prepared = std::process::Command::new(command.get_program());
+    let mut has_path = false;
+    for argument in command.get_args() {
+        if argument == "{path}" {
+            prepared.arg(target);
+            has_path = true;
+        } else if argument == "{page}" {
+            prepared.arg(page.unwrap_or(1).to_string());
+        } else {
+            prepared.arg(argument);
+        }
+    }
+    if !has_path {
+        prepared.arg(target);
+    }
+    prepared
 }
 
 fn copy_to_clipboard(text: &str) -> Result<()> {
@@ -1701,8 +1925,12 @@ fn draw(f: &mut Frame, app: &mut App) {
     };
 
     // Search / add bar
-    let search_content = if let Some(ref add_text) = app.add_input {
+    let search_content = if let Some(ref semantic_text) = app.semantic_input {
+        Line::from(Span::styled(semantic_text.as_str(), s_text))
+    } else if let Some(ref add_text) = app.add_input {
         Line::from(Span::styled(add_text.as_str(), s_text))
+    } else if let Some(ref view) = app.semantic_view {
+        Line::from(Span::styled(view.query.as_str(), s_text))
     } else {
         let mut spans = Vec::new();
         if let Some(ref tag) = app.tag_filter {
@@ -1714,7 +1942,9 @@ fn draw(f: &mut Frame, app: &mut App) {
         Line::from(spans)
     };
 
-    let search_title = if app.add_input.is_some() {
+    let search_title = if app.semantic_input.is_some() || app.semantic_view.is_some() {
+        Line::from(Span::styled(" Semantic Search ", s_hl))
+    } else if app.add_input.is_some() {
         Line::from(Span::styled(" Add ", s_hl))
     } else {
         Line::from(Span::styled(" Search ", s_hl))
@@ -1729,7 +1959,10 @@ fn draw(f: &mut Frame, app: &mut App) {
     f.render_widget(Paragraph::new(search_content), search_inner);
 
     // Cursor position for input
-    if let Some(add_text) = &app.add_input {
+    if let Some(semantic_text) = &app.semantic_input {
+        let cursor_x = search_inner.x + semantic_text.len() as u16;
+        f.set_cursor_position((cursor_x, search_inner.y));
+    } else if let Some(add_text) = &app.add_input {
         let cursor_x = search_inner.x + add_text.len() as u16;
         f.set_cursor_position((cursor_x, search_inner.y));
     } else if app.input_mode == InputMode::Search {
@@ -1739,8 +1972,24 @@ fn draw(f: &mut Frame, app: &mut App) {
     }
 
     // Status bar as bottom title of list
-    let count_str = format!(" {}/{} ", app.filtered_indices.len(), app.entries.len());
-    let mode_indicator = if app.add_input.is_some() {
+    let count_str = if let Some(view) = &app.semantic_view {
+        format!(" {} results ", view.results.len())
+    } else {
+        format!(" {}/{} ", app.filtered_indices.len(), app.entries.len())
+    };
+    let mode_indicator = if app.semantic_input.is_some() || app.semantic_view.is_some() {
+        Span::styled(
+            if app.semantic_rx.is_some() {
+                " SEARCHING "
+            } else {
+                " SEMANTIC "
+            },
+            Style::default()
+                .fg(t.status_fg)
+                .bg(t.insert_bg)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else if app.add_input.is_some() {
         // Add mode is orthogonal to Browse/Search (it's a text-entry overlay),
         // so it gets its own indicator with a distinct accent.
         Span::styled(
@@ -1768,7 +2017,11 @@ fn draw(f: &mut Frame, app: &mut App) {
             ),
         }
     };
-    let mode_hint = if app.add_input.is_some() {
+    let mode_hint = if app.semantic_input.is_some() {
+        " enter search  esc cancel "
+    } else if app.semantic_view.is_some() {
+        " enter open  v edit  esc papers "
+    } else if app.add_input.is_some() {
         " enter add  esc cancel "
     } else {
         match (app.input_mode, &app.mode) {
@@ -1788,23 +2041,32 @@ fn draw(f: &mut Frame, app: &mut App) {
     // Show the sort indicator whenever the ordering isn't the clean default
     // (name, ascending). The arrow reflects the effective direction: a field's
     // default direction, flipped by `sort_reverse`.
-    let sort_right =
-        if app.filter.is_empty() && (app.sort_mode != SortMode::Name || app.sort_reverse) {
-            let descending = app.sort_mode.defaults_descending() ^ app.sort_reverse;
-            let arrow = if descending { "↓" } else { "↑" };
-            Line::from(Span::styled(
-                format!(" sort: {} {} ", app.sort_mode.label(), arrow),
-                s_hl,
-            ))
-        } else {
-            Line::default()
-        };
+    let sort_right = if app.semantic_view.is_none()
+        && app.filter.is_empty()
+        && (app.sort_mode != SortMode::Name || app.sort_reverse)
+    {
+        let descending = app.sort_mode.defaults_descending() ^ app.sort_reverse;
+        let arrow = if descending { "↓" } else { "↑" };
+        Line::from(Span::styled(
+            format!(" sort: {} {} ", app.sort_mode.label(), arrow),
+            s_hl,
+        ))
+    } else {
+        Line::default()
+    };
 
     if show_list {
         let list_block = Block::default()
             .borders(Borders::ALL)
             .border_style(border_style)
-            .title(Line::from(Span::styled(" Papers ", s_hl)))
+            .title(Line::from(Span::styled(
+                if app.semantic_view.is_some() {
+                    " Passages "
+                } else {
+                    " Papers "
+                },
+                s_hl,
+            )))
             .title_bottom(bottom_left)
             .title_bottom(sort_right.alignment(ratatui::layout::Alignment::Right));
 
@@ -1817,7 +2079,68 @@ fn draw(f: &mut Frame, app: &mut App) {
         let prefix_width = 3 + 6 + 14; // highlight_symbol + year + author
         let title_max = list_width.saturating_sub(prefix_width);
 
-        if app.filtered_indices.is_empty() {
+        if let Some(view) = app.semantic_view.as_mut() {
+            if app.semantic_rx.is_some() {
+                f.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        "Embedding query and ranking passages…",
+                        s_dim,
+                    )))
+                    .alignment(ratatui::layout::Alignment::Center),
+                    list_inner,
+                );
+            } else if view.results.is_empty() {
+                f.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        "No indexed passages match this query.",
+                        s_dim,
+                    )))
+                    .alignment(ratatui::layout::Alignment::Center),
+                    list_inner,
+                );
+            } else {
+                let excerpt_width = list_width.saturating_sub(6).max(8);
+                let items: Vec<ListItem> = view
+                    .results
+                    .iter()
+                    .enumerate()
+                    .map(|(rank, hit)| {
+                        let page = hit
+                            .pages
+                            .first()
+                            .map(|page| format!(" · p. {page}"))
+                            .unwrap_or_default();
+                        let heading = if hit.headings.is_empty() {
+                            String::new()
+                        } else {
+                            format!("  {}", hit.headings.join(" › "))
+                        };
+                        let compact = hit.text.split_whitespace().collect::<Vec<_>>().join(" ");
+                        vec![
+                            Line::from(vec![
+                                Span::styled(format!(" {:>2}. ", rank + 1), s_date),
+                                Span::styled(hit.paper_title.as_str(), s_text),
+                                Span::styled(page, s_hl),
+                            ]),
+                            Line::from(Span::styled(heading, s_author)),
+                            Line::from(Span::styled(
+                                format!("  {}", truncate_ellipsis(&compact, excerpt_width)),
+                                s_dim,
+                            )),
+                        ]
+                    })
+                    .map(ListItem::new)
+                    .collect();
+                let list = List::new(items)
+                    .highlight_style(
+                        Style::default()
+                            .bg(t.selection)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                    .highlight_symbol(" > ");
+                f.render_stateful_widget(list, list_inner, &mut view.list_state);
+            }
+        } else if app.filtered_indices.is_empty() {
             let is_query_importable = is_importable(&app.filter);
             let msg = if is_query_importable {
                 vec![
@@ -1942,7 +2265,11 @@ fn draw(f: &mut Frame, app: &mut App) {
             link: s_link,
             date: s_date,
         };
-        draw_preview(f, app, content_area, &styles);
+        if let Some(hit) = app.selected_semantic_hit() {
+            draw_semantic_preview(f, hit, content_area, app.preview_scroll, &styles);
+        } else {
+            draw_preview(f, app, content_area, &styles);
+        }
     }
 
     // Tag picker popup
@@ -2186,6 +2513,7 @@ fn draw(f: &mut Frame, app: &mut App) {
             ("^f / ^b", "Page down / up"),
             ("J / K", "Scroll preview down / up"),
             ("/ or i", "Enter search mode"),
+            ("v", "Semantic passage search"),
             ("enter", "Open PDF"),
             ("space", "Toggle full-screen abstract"),
             ("e", "Edit info.toml"),
@@ -2212,6 +2540,13 @@ fn draw(f: &mut Frame, app: &mut App) {
             ("^f / ^b", "Page down / up"),
             ("enter", "Open PDF"),
             ("tab", "Browse tags"),
+            ("", ""),
+            ("", "Semantic results"),
+            ("j / k", "Move through ranked passages"),
+            ("enter", "Open PDF at result page"),
+            ("space", "Toggle full passage preview"),
+            ("v", "Edit semantic query"),
+            ("esc", "Return to papers"),
         ];
 
         let height = help_lines.len() as u16 + 4;
@@ -2266,6 +2601,56 @@ struct Styles {
     highlight: Style,
     link: Style,
     date: Style,
+}
+
+fn draw_semantic_preview(f: &mut Frame, hit: &SearchHit, area: Rect, scroll: u16, s: &Styles) {
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            hit.paper_title.as_str(),
+            s.text.add_modifier(Modifier::BOLD),
+        )),
+    ];
+    let pages = match hit.pages.as_slice() {
+        [] => String::new(),
+        [page] => format!("page {page}"),
+        pages => format!(
+            "pages {}",
+            pages
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    };
+    lines.push(Line::from(vec![
+        Span::styled(format!("similarity {:.3}", hit.similarity), s.date),
+        Span::styled(
+            if pages.is_empty() {
+                String::new()
+            } else {
+                format!(" · {pages}")
+            },
+            s.highlight,
+        ),
+    ]));
+    if !hit.headings.is_empty() {
+        lines.push(Line::from(Span::styled(hit.headings.join(" › "), s.author)));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(hit.text.as_str(), s.dim)));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        format!("{} · chunk {}", hit.source_path, hit.chunk_index),
+        s.muted,
+    )));
+
+    f.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0)),
+        area,
+    );
 }
 
 fn draw_preview(f: &mut Frame, app: &App, area: ratatui::layout::Rect, s: &Styles) {
@@ -2790,7 +3175,10 @@ fn draw_dedup(
 
 #[cfg(test)]
 mod tests {
-    use super::{LayoutMode, picker_rect};
+    use std::path::Path;
+    use std::process::Command;
+
+    use super::{LayoutMode, picker_rect, prepare_reader_command, semantic_error_message};
     use ratatui::layout::Rect;
 
     #[test]
@@ -2833,5 +3221,39 @@ mod tests {
     fn auto_advances_from_its_resolved_layout() {
         assert_eq!(LayoutMode::Auto.next(120, 40), LayoutMode::Tall);
         assert_eq!(LayoutMode::Auto.next(80, 50), LayoutMode::FullList);
+    }
+
+    #[test]
+    fn reader_template_places_page_and_path_for_pdfterm() {
+        let mut command = Command::new("kitty");
+        command.args(["@", "launch", "pdfterm", "--page", "{page}", "{path}"]);
+
+        let prepared = prepare_reader_command(command, Path::new("synthetic.pdf"), Some(7));
+
+        assert_eq!(prepared.get_program(), "kitty");
+        assert_eq!(
+            prepared.get_args().collect::<Vec<_>>(),
+            ["@", "launch", "pdfterm", "--page", "7", "synthetic.pdf"]
+        );
+    }
+
+    #[test]
+    fn reader_without_template_still_appends_path() {
+        let command = Command::new("open");
+        let prepared = prepare_reader_command(command, Path::new("synthetic.pdf"), Some(7));
+
+        assert_eq!(prepared.get_args().collect::<Vec<_>>(), ["synthetic.pdf"]);
+    }
+
+    #[test]
+    fn stale_semantic_index_error_is_concise() {
+        let error = anyhow::anyhow!(
+            "Semantic index uses model old/model; expected current/model. Run `grimoire semantic-index` to rebuild it."
+        );
+
+        assert_eq!(
+            semantic_error_message(&error),
+            "Semantic index was built with an older model; run `grimoire semantic-index`"
+        );
     }
 }

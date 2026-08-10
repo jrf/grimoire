@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(untagged)]
@@ -39,6 +39,56 @@ pub struct Config {
     pub theme: Option<String>,
     pub theme_catalog: Option<String>,
     pub layout: Option<String>,
+    pub semantic_results: Option<usize>,
+    #[serde(default)]
+    pub embedding: EmbeddingConfig,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct EmbeddingConfig {
+    pub repo: String,
+    pub revision: String,
+    pub model_file: String,
+    pub external_files: Vec<String>,
+    pub tokenizer_file: String,
+    pub config_file: String,
+    pub special_tokens_map_file: String,
+    pub tokenizer_config_file: String,
+    pub pooling: String,
+    pub output: Option<EmbeddingOutput>,
+    pub query_template: String,
+    pub document_template: String,
+    pub max_length: usize,
+    pub batch_size: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum EmbeddingOutput {
+    Name(String),
+    Index(usize),
+}
+
+impl Default for EmbeddingConfig {
+    fn default() -> Self {
+        Self {
+            repo: "onnx-community/embeddinggemma-300m-ONNX".to_string(),
+            revision: "5090578d9565bb06545b4552f76e6bc2c93e4a66".to_string(),
+            model_file: "onnx/model_q4.onnx".to_string(),
+            external_files: vec!["onnx/model_q4.onnx_data".to_string()],
+            tokenizer_file: "tokenizer.json".to_string(),
+            config_file: "config.json".to_string(),
+            special_tokens_map_file: "special_tokens_map.json".to_string(),
+            tokenizer_config_file: "tokenizer_config.json".to_string(),
+            pooling: "mean".to_string(),
+            output: Some(EmbeddingOutput::Name("sentence_embedding".to_string())),
+            query_template: "task: search result | query: {query}".to_string(),
+            document_template: "title: {title} | text: {text}".to_string(),
+            max_length: 2048,
+            batch_size: 32,
+        }
+    }
 }
 
 impl Config {
@@ -56,6 +106,8 @@ impl Config {
                 theme: None,
                 theme_catalog: None,
                 layout: None,
+                semantic_results: None,
+                embedding: EmbeddingConfig::default(),
             })
         }
     }
@@ -87,6 +139,10 @@ impl Config {
             self.browser.as_ref(),
             default_opener(),
         )
+    }
+
+    pub fn semantic_results(&self) -> Option<usize> {
+        self.semantic_results.filter(|limit| *limit > 0)
     }
 
     /// Resolve an external command: the first set `env_vars` wins (the
@@ -127,7 +183,7 @@ fn default_opener() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{ExternalCommand, default_opener};
+    use super::{Config, EmbeddingOutput, ExternalCommand, default_opener};
     use serde::Deserialize;
 
     #[derive(Deserialize)]
@@ -161,5 +217,35 @@ mod tests {
 
         #[cfg(not(target_os = "macos"))]
         assert_eq!(default_opener(), "xdg-open");
+    }
+
+    #[test]
+    fn semantic_result_count_defaults_to_all() {
+        let default: Config = toml::from_str("").unwrap();
+        let configured: Config = toml::from_str("semantic_results = 25").unwrap();
+        let zero: Config = toml::from_str("semantic_results = 0").unwrap();
+
+        assert_eq!(default.semantic_results(), None);
+        assert_eq!(configured.semantic_results(), Some(25));
+        assert_eq!(zero.semantic_results(), None);
+    }
+
+    #[test]
+    fn embedding_profile_can_override_model_and_output_index() {
+        let config: Config = toml::from_str(
+            r#"
+            [embedding]
+            repo = "synthetic/model"
+            revision = "synthetic-revision"
+            model_file = "model.onnx"
+            output = 2
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.embedding.repo, "synthetic/model");
+        assert_eq!(config.embedding.model_file, "model.onnx");
+        assert_eq!(config.embedding.output, Some(EmbeddingOutput::Index(2)));
+        assert_eq!(config.embedding.pooling, "mean");
     }
 }

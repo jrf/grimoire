@@ -9,6 +9,7 @@ clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 crossterm = { version = "0.28", features = ["use-dev-tty"] }
 dirs = "6"
+fastembed = { version = "5.17.4", default-features = false, features = ["ort-download-binaries-native-tls"] }
 flate2 = "1.1.9"
 lopdf = "0.34"
 nucleo-matcher = "0.3"
@@ -20,6 +21,7 @@ rusqlite = { version = "0.35", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_norway = "0.9"
+sha2 = "0.10"
 shellexpand = "3"
 slug = "0.1"
 tempfile = "3"
