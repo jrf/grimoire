@@ -44,6 +44,8 @@ grimoire backfill                 # fetch missing PDFs + abstracts for existing 
 grimoire backfill --check         # report how many entries are missing a PDF / abstract
 grimoire backfill --pdfs-only     # only download missing PDFs (open-access)
 grimoire reindex                  # rebuild search index from filesystem
+grimoire semantic-index           # embed JSONL passages under derived/ directories
+grimoire semantic "retrieval limitations"  # ranked vector-similarity passage search
 grimoire validate                 # check library integrity
 grimoire validate --fix           # auto-fix issues (rename temp files, remove junk)
 grimoire completions fish         # emit a shell completion script
@@ -56,6 +58,7 @@ grimoire completions fish         # emit a shell completion script
 | `j / k` | Move down / up |
 | `g / G` | Jump to top / bottom |
 | `/ or i` | Enter search mode |
+| `ctrl-s` | Search indexed passages semantically |
 | `enter` | Open PDF (browse), confirm search (search) |
 | `e` | Edit info.toml |
 | `y` | Copy BibTeX |
@@ -116,6 +119,7 @@ browser = ["open"]          # URL opener; defaults to $BROWSER or the OS opener
 theme = "~/.config/themes/tokyo-night-moon.toml"
 theme_catalog = "~/.config/themes/catalog.toml"
 layout = "full"            # full (default), wide, tall, or auto; auto detects wide/tall
+semantic_results = 10       # ranked passages shown by TUI semantic search
 ```
 
 `theme` is loaded directly. `theme_catalog` contains an explicit `themes = [...]`
@@ -173,6 +177,50 @@ If an incoming reference matches an existing entry by DOI or normalized title,
 `add` warns and skips it; pass `--force` to import anyway. The interactive
 deduplicator (`d` in the TUI) groups existing references that share a title
 **or** DOI so you can merge them after the fact.
+
+## Semantic search
+
+`grimoire semantic-index` recursively reads `*.jsonl` files below each paper's
+`derived/` directory and builds a local passage index in `.grimoire.db`. Rows
+may come from Docling or another exporter. Grimoire looks for passage content in
+`text`, `content`, `page_content`, or `raw_text`; headings, page numbers, and
+chunk identifiers are optional, and the original JSON object is preserved as
+metadata.
+
+Embeddings use a pinned, Q4 ONNX export of Google's on-device EmbeddingGemma
+300M model. The model is downloaded on first use and cached locally; document
+text is not sent to an embedding API. Run `grimoire semantic "your
+natural-language query"` to print ranked results, or press `ctrl-s` in the TUI
+to browse the configured top `semantic_results` passages with headings and page
+numbers. Re-run `semantic-index` after regenerating the JSONL files. Model
+downloads honor `HF_ENDPOINT` and the standard `SSL_CERT_FILE`,
+`REQUESTS_CA_BUNDLE`, or `CURL_CA_BUNDLE` PEM bundle.
+
+The embedding model is fully configurable. Pin a Hugging Face ONNX repository
+and revision so an upstream update cannot silently invalidate the index:
+
+```toml
+[embedding]
+repo = "onnx-community/embeddinggemma-300m-ONNX"
+revision = "5090578d9565bb06545b4552f76e6bc2c93e4a66"
+model_file = "onnx/model_q4.onnx"
+external_files = ["onnx/model_q4.onnx_data"]
+tokenizer_file = "tokenizer.json"
+config_file = "config.json"
+special_tokens_map_file = "special_tokens_map.json"
+tokenizer_config_file = "tokenizer_config.json"
+pooling = "mean"                 # mean, cls, or none
+output = "sentence_embedding"   # known name, or a numeric ONNX output index
+query_template = "task: search result | query: {query}"
+document_template = "title: {title} | text: {text}"
+max_length = 2048
+batch_size = 32
+```
+
+Changing the profile makes Grimoire request a fresh `semantic-index` instead
+of comparing incompatible embeddings. Model paths must be relative to the
+configured repository; `{query}` and `{text}` are required in their respective
+templates, while `{title}` is optional.
 
 ## Backfill
 
