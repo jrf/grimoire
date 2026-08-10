@@ -22,7 +22,7 @@ use crate::config::Config as AppConfig;
 use crate::index;
 use crate::metadata;
 use crate::model::Reference;
-use crate::semantic::{self, SearchHit, SearchRanking};
+use crate::semantic::{self, PaperSearchHit, SearchHit, SearchRanking};
 use crate::storage;
 use crate::theme::{self, Theme};
 use crate::validate;
@@ -104,16 +104,70 @@ pub struct App {
 
 struct SemanticView {
     query: String,
-    results: Vec<SearchHit>,
+    results: SemanticResults,
+    scope: SemanticScope,
     ranking: Option<SearchRanking>,
+    error: Option<String>,
     total: usize,
     list_state: ListState,
 }
 
 struct SemanticLoad {
     ranking: SearchRanking,
-    results: Vec<SearchHit>,
+    results: Vec<PaperSearchHit>,
     total: usize,
+}
+
+enum SemanticResults {
+    Papers(Vec<PaperSearchHit>),
+    Passages(Vec<SearchHit>),
+}
+
+#[derive(Clone)]
+enum SemanticScope {
+    Papers,
+    AllPassages {
+        paper_index: usize,
+        paper_loaded: usize,
+    },
+    PaperPassages {
+        dir_name: String,
+        paper_index: usize,
+        paper_loaded: usize,
+    },
+}
+
+impl SemanticResults {
+    fn len(&self) -> usize {
+        match self {
+            Self::Papers(results) => results.len(),
+            Self::Passages(results) => results.len(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn selected_hit(&self, selected: usize) -> Option<&SearchHit> {
+        match self {
+            Self::Papers(results) => results.get(selected)?.passages.first(),
+            Self::Passages(results) => results.get(selected),
+        }
+    }
+}
+
+impl SemanticScope {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Papers => "papers",
+            Self::AllPassages { .. } | Self::PaperPassages { .. } => "passages",
+        }
+    }
+
+    fn is_expanded(&self) -> bool {
+        matches!(self, Self::PaperPassages { .. })
+    }
 }
 
 struct ValidatePopup {
@@ -450,8 +504,10 @@ fn run_event_loop(terminal: &mut Term, app: &mut App, tty_ctl: &mut File) -> Res
                 Ok(Ok(load)) => {
                     app.semantic_rx = None;
                     if let Some(view) = app.semantic_view.as_mut() {
-                        view.results = load.results;
+                        view.results = SemanticResults::Papers(load.results);
+                        view.scope = SemanticScope::Papers;
                         view.ranking = Some(load.ranking);
+                        view.error = None;
                         view.total = load.total;
                         view.list_state
                             .select((!view.results.is_empty()).then_some(0));
@@ -461,14 +517,17 @@ fn run_event_loop(terminal: &mut Term, app: &mut App, tty_ctl: &mut File) -> Res
                 }
                 Ok(Err(error)) => {
                     app.semantic_rx = None;
-                    app.flash = Some((error, std::time::Instant::now()));
+                    if let Some(view) = app.semantic_view.as_mut() {
+                        view.error = Some(error);
+                    }
+                    continue;
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     app.semantic_rx = None;
-                    app.flash = Some((
-                        "Semantic search failed".to_string(),
-                        std::time::Instant::now(),
-                    ));
+                    if let Some(view) = app.semantic_view.as_mut() {
+                        view.error = Some("Semantic search failed".to_string());
+                    }
+                    continue;
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
             }
@@ -739,6 +798,14 @@ fn run_event_loop(terminal: &mut Term, app: &mut App, tty_ctl: &mut File) -> Res
                     (KeyCode::Esc, _) if app.preview_overlay => {
                         app.preview_overlay = false;
                     }
+                    (KeyCode::Esc, _)
+                        if app
+                            .semantic_view
+                            .as_ref()
+                            .is_some_and(|view| view.scope.is_expanded()) =>
+                    {
+                        app.return_to_semantic_papers();
+                    }
                     (KeyCode::Esc, _) if app.semantic_view.is_some() => {
                         app.clear_semantic();
                     }
@@ -755,6 +822,23 @@ fn run_event_loop(terminal: &mut Term, app: &mut App, tty_ctl: &mut File) -> Res
                                 .map(|view| view.query.clone())
                                 .unwrap_or_default(),
                         );
+                    }
+
+                    (KeyCode::Char('p'), KeyModifiers::NONE) if app.semantic_view.is_some() => {
+                        app.toggle_selected_semantic_paper();
+                    }
+                    (KeyCode::Char('P'), _) if app.semantic_view.is_some() => {
+                        app.toggle_all_semantic_passages();
+                    }
+                    (KeyCode::Char('l'), KeyModifiers::NONE) | (KeyCode::Right, _)
+                        if app.semantic_view.is_some() =>
+                    {
+                        app.expand_selected_semantic_paper();
+                    }
+                    (KeyCode::Char('h'), KeyModifiers::NONE) | (KeyCode::Left, _)
+                        if app.semantic_view.is_some() =>
+                    {
+                        app.return_to_semantic_papers();
                     }
 
                     (KeyCode::Char('/'), KeyModifiers::NONE)
@@ -1027,8 +1111,10 @@ impl App {
         self.semantic_rx = Some(rx);
         self.semantic_view = Some(SemanticView {
             query,
-            results: Vec::new(),
+            results: SemanticResults::Papers(Vec::new()),
+            scope: SemanticScope::Papers,
             ranking: None,
+            error: None,
             total: 0,
             list_state: ListState::default(),
         });
@@ -1038,9 +1124,12 @@ impl App {
         std::thread::spawn(move || {
             let result = (|| {
                 let ranking = semantic::rank_silent(&library, &worker_query, &embedding)?;
-                let total = limit.map_or_else(|| ranking.total(), |cap| cap.min(ranking.total()));
+                let total = limit.map_or_else(
+                    || ranking.paper_total(),
+                    |cap| cap.min(ranking.paper_total()),
+                );
                 let page_size = semantic::DEFAULT_PAGE_SIZE.min(total).max(1);
-                let page = ranking.page(&library, 0, page_size)?;
+                let page = ranking.paper_page(&library, 0, page_size, 1)?;
                 Ok(SemanticLoad {
                     ranking,
                     results: page.hits,
@@ -1059,23 +1148,202 @@ impl App {
                 return;
             };
             let selected = view.list_state.selected().unwrap_or(0);
-            if !should_load_more_semantic(selected, view.results.len(), view.total) {
+            let loaded = view.results.len();
+            if !should_load_more_semantic(selected, loaded, view.total) {
                 return;
             }
             let Some(ranking) = view.ranking.as_ref() else {
                 return;
             };
-            let offset = view.results.len();
+            let offset = loaded;
             let page_size = semantic::DEFAULT_PAGE_SIZE.min(view.total - offset);
-            ranking
-                .page(&library, offset, page_size)
-                .map(|page| view.results.extend(page.hits))
+            match (&view.scope, &mut view.results) {
+                (SemanticScope::Papers, SemanticResults::Papers(results)) => ranking
+                    .paper_page(&library, offset, page_size, 1)
+                    .map(|page| results.extend(page.hits)),
+                (SemanticScope::AllPassages { .. }, SemanticResults::Passages(results)) => ranking
+                    .page(&library, offset, page_size)
+                    .map(|page| results.extend(page.hits)),
+                (
+                    SemanticScope::PaperPassages { dir_name, .. },
+                    SemanticResults::Passages(results),
+                ) => ranking
+                    .paper_passage_page(&library, dir_name, offset, page_size)
+                    .map(|page| results.extend(page.hits)),
+                _ => return,
+            }
         };
         if let Err(error) = result {
             self.flash = Some((
                 format!("Could not load more semantic results: {error}"),
                 std::time::Instant::now(),
             ));
+        }
+    }
+
+    fn show_all_semantic_passages(&mut self) {
+        let library = self.config.library_dir();
+        let cap = self.config.semantic_results();
+        let result: Result<()> = (|| {
+            let view = self
+                .semantic_view
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("Semantic results are not open"))?;
+            let ranking = view
+                .ranking
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Semantic ranking is still loading"))?;
+            let (paper_index, paper_loaded) = match &view.scope {
+                SemanticScope::Papers => {
+                    (view.list_state.selected().unwrap_or(0), view.results.len())
+                }
+                SemanticScope::PaperPassages {
+                    paper_index,
+                    paper_loaded,
+                    ..
+                } => (*paper_index, *paper_loaded),
+                SemanticScope::AllPassages { .. } => return Ok(()),
+            };
+            let total = cap.map_or_else(|| ranking.total(), |cap| cap.min(ranking.total()));
+            let page_size = semantic::DEFAULT_PAGE_SIZE.min(total).max(1);
+            let page = ranking.page(&library, 0, page_size)?;
+            view.results = SemanticResults::Passages(page.hits);
+            view.scope = SemanticScope::AllPassages {
+                paper_index,
+                paper_loaded,
+            };
+            view.total = total;
+            view.list_state
+                .select((!view.results.is_empty()).then_some(0));
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.flash = Some((
+                format!("Could not load all semantic passages: {error}"),
+                std::time::Instant::now(),
+            ));
+        }
+        self.preview_overlay = false;
+        self.preview_scroll = 0;
+    }
+
+    fn toggle_all_semantic_passages(&mut self) {
+        if self
+            .semantic_view
+            .as_ref()
+            .is_some_and(|view| matches!(&view.scope, SemanticScope::AllPassages { .. }))
+        {
+            self.return_to_semantic_papers();
+        } else {
+            self.show_all_semantic_passages();
+        }
+    }
+
+    fn toggle_selected_semantic_paper(&mut self) {
+        if self
+            .semantic_view
+            .as_ref()
+            .is_some_and(|view| matches!(&view.scope, SemanticScope::PaperPassages { .. }))
+        {
+            self.return_to_semantic_papers();
+        } else {
+            self.expand_selected_semantic_paper();
+        }
+    }
+
+    fn expand_selected_semantic_paper(&mut self) {
+        let library = self.config.library_dir();
+        let cap = self.config.semantic_results();
+        let result: Result<()> = (|| {
+            let view = self
+                .semantic_view
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("Semantic results are not open"))?;
+            if !matches!(&view.scope, SemanticScope::Papers) {
+                return Ok(());
+            }
+            let selected = view
+                .list_state
+                .selected()
+                .ok_or_else(|| anyhow::anyhow!("No paper is selected"))?;
+            let SemanticResults::Papers(papers) = &view.results else {
+                anyhow::bail!("Semantic paper results are unavailable");
+            };
+            let paper = papers
+                .get(selected)
+                .ok_or_else(|| anyhow::anyhow!("Selected paper is unavailable"))?;
+            let dir_name = paper.dir_name.clone();
+            let paper_loaded = papers.len();
+            let ranking = view
+                .ranking
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Semantic ranking is still loading"))?;
+            let mut page =
+                ranking.paper_passage_page(&library, &dir_name, 0, semantic::DEFAULT_PAGE_SIZE)?;
+            let total = cap.map_or(page.total, |cap| cap.min(page.total));
+            page.hits.truncate(total);
+            view.results = SemanticResults::Passages(page.hits);
+            view.scope = SemanticScope::PaperPassages {
+                dir_name,
+                paper_index: selected,
+                paper_loaded,
+            };
+            view.total = total;
+            view.list_state
+                .select((!view.results.is_empty()).then_some(0));
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.flash = Some((
+                format!("Could not load passages for this paper: {error}"),
+                std::time::Instant::now(),
+            ));
+        }
+        self.preview_overlay = false;
+        self.preview_scroll = 0;
+    }
+
+    fn return_to_semantic_papers(&mut self) -> bool {
+        let library = self.config.library_dir();
+        let Some(view) = self.semantic_view.as_mut() else {
+            return false;
+        };
+        let (paper_index, paper_loaded) = match view.scope.clone() {
+            SemanticScope::PaperPassages {
+                paper_index,
+                paper_loaded,
+                ..
+            }
+            | SemanticScope::AllPassages {
+                paper_index,
+                paper_loaded,
+            } => (paper_index, paper_loaded),
+            SemanticScope::Papers => return false,
+        };
+        let Some(ranking) = view.ranking.as_ref() else {
+            return false;
+        };
+        match ranking.paper_page(&library, 0, paper_loaded.max(1), 1) {
+            Ok(page) => {
+                view.results = SemanticResults::Papers(page.hits);
+                view.scope = SemanticScope::Papers;
+                view.total = self
+                    .config
+                    .semantic_results()
+                    .map_or(page.total, |cap| cap.min(page.total));
+                view.list_state
+                    .select(Some(paper_index.min(view.results.len().saturating_sub(1))));
+                self.preview_overlay = false;
+                self.preview_scroll = 0;
+                true
+            }
+            Err(error) => {
+                self.flash = Some((
+                    format!("Could not return to paper results: {error}"),
+                    std::time::Instant::now(),
+                ));
+                false
+            }
         }
     }
 
@@ -1153,7 +1421,7 @@ impl App {
 
     fn selected_semantic_hit(&self) -> Option<&SearchHit> {
         let view = self.semantic_view.as_ref()?;
-        view.results.get(view.list_state.selected()?)
+        view.results.selected_hit(view.list_state.selected()?)
     }
 
     fn move_up(&mut self) {
@@ -1724,7 +1992,11 @@ impl App {
 
 fn semantic_error_message(error: &anyhow::Error) -> String {
     let detail = format!("{error:#}");
-    if detail.contains("Semantic index uses model") {
+    if detail.contains("Semantic index is not initialized")
+        || detail.contains("Semantic index is empty")
+    {
+        "Semantic index not built.\nRun `grimoire semantic-index` first.".to_string()
+    } else if detail.contains("Semantic index uses model") {
         "Semantic index was built with an older model; run `grimoire semantic-index`".to_string()
     } else {
         format!("Semantic search: {detail}")
@@ -2075,7 +2347,7 @@ fn draw(f: &mut Frame, app: &mut App) {
                 format!(" {}", view.results.len()),
                 s_date.add_modifier(Modifier::BOLD),
             ),
-            Span::styled(" loaded · ", s_text),
+            Span::styled(format!(" {} loaded · ", view.scope.label()), s_text),
             Span::styled(view.total.to_string(), s_hl.add_modifier(Modifier::BOLD)),
             Span::styled(" total ", s_text),
         ]);
@@ -2095,14 +2367,43 @@ fn draw(f: &mut Frame, app: &mut App) {
     }
     if let Some(flash) = app.flash_message() {
         bottom_spans.push(Span::styled(format!(" {} ", flash), s_hl));
-    } else if app.semantic_view.is_some() && app.semantic_input.is_none() {
+    } else if let Some(view) = app
+        .semantic_view
+        .as_ref()
+        .filter(|_| app.semantic_input.is_none())
+    {
+        match &view.scope {
+            SemanticScope::Papers => bottom_spans.extend([
+                Span::styled(" p", s_link.add_modifier(Modifier::BOLD)),
+                Span::styled(" passages  ", s_text),
+                Span::styled("P", s_author.add_modifier(Modifier::BOLD)),
+                Span::styled(" all passages  ", s_text),
+            ]),
+            SemanticScope::AllPassages { .. } => bottom_spans.extend([
+                Span::styled(" P", s_author.add_modifier(Modifier::BOLD)),
+                Span::styled(" papers  ", s_text),
+            ]),
+            SemanticScope::PaperPassages { .. } => bottom_spans.extend([
+                Span::styled(" p", s_link.add_modifier(Modifier::BOLD)),
+                Span::styled(" papers  ", s_text),
+                Span::styled("P", s_author.add_modifier(Modifier::BOLD)),
+                Span::styled(" all passages  ", s_text),
+            ]),
+        }
         bottom_spans.extend([
             Span::styled(" enter", s_link.add_modifier(Modifier::BOLD)),
             Span::styled(" open  ", s_text),
             Span::styled("v", s_author.add_modifier(Modifier::BOLD)),
             Span::styled(" edit  ", s_text),
             Span::styled("esc", s_hl.add_modifier(Modifier::BOLD)),
-            Span::styled(" papers ", s_text),
+            Span::styled(
+                if view.scope.is_expanded() {
+                    " back "
+                } else {
+                    " papers "
+                },
+                s_text,
+            ),
         ]);
     } else if app.semantic_input.is_some() {
         bottom_spans.extend([
@@ -2153,17 +2454,17 @@ fn draw(f: &mut Frame, app: &mut App) {
     };
 
     if show_list {
+        let list_title = app.semantic_view.as_ref().map_or(" Papers ", |view| {
+            if matches!(&view.scope, SemanticScope::Papers) {
+                " Papers "
+            } else {
+                " Passages "
+            }
+        });
         let list_block = Block::default()
             .borders(Borders::ALL)
             .border_style(border_style)
-            .title(Line::from(Span::styled(
-                if app.semantic_view.is_some() {
-                    " Passages "
-                } else {
-                    " Papers "
-                },
-                s_hl,
-            )))
+            .title(Line::from(Span::styled(list_title, s_hl)))
             .title_bottom(bottom_left)
             .title_bottom(sort_right.alignment(ratatui::layout::Alignment::Right));
 
@@ -2186,6 +2487,27 @@ fn draw(f: &mut Frame, app: &mut App) {
                     .alignment(ratatui::layout::Alignment::Center),
                     list_inner,
                 );
+            } else if let Some(error) = &view.error {
+                let lines = error
+                    .lines()
+                    .enumerate()
+                    .map(|(index, line)| {
+                        Line::from(Span::styled(
+                            line,
+                            if index == 0 {
+                                s_hl.add_modifier(Modifier::BOLD)
+                            } else {
+                                s_text
+                            },
+                        ))
+                    })
+                    .collect::<Vec<_>>();
+                f.render_widget(
+                    Paragraph::new(lines)
+                        .alignment(ratatui::layout::Alignment::Center)
+                        .wrap(Wrap { trim: true }),
+                    list_inner,
+                );
             } else if view.results.is_empty() {
                 f.render_widget(
                     Paragraph::new(Line::from(Span::styled(
@@ -2197,37 +2519,94 @@ fn draw(f: &mut Frame, app: &mut App) {
                 );
             } else {
                 let excerpt_width = list_width.saturating_sub(6).max(8);
-                let items: Vec<ListItem> = view
-                    .results
-                    .iter()
-                    .enumerate()
-                    .map(|(rank, hit)| {
-                        let page = hit
-                            .pages
-                            .first()
-                            .map(|page| format!(" · p. {page}"))
-                            .unwrap_or_default();
-                        let heading = if hit.headings.is_empty() {
-                            String::new()
-                        } else {
-                            format!("  {}", semantic_heading_text(&hit.headings))
-                        };
-                        let compact = hit.text.split_whitespace().collect::<Vec<_>>().join(" ");
-                        vec![
-                            Line::from(vec![
-                                Span::styled(format!(" {:>2}. ", rank + 1), s_date),
-                                Span::styled(hit.paper_title.as_str(), s_text),
-                                Span::styled(page, s_hl),
-                            ]),
-                            Line::from(Span::styled(heading, s_author)),
-                            Line::from(Span::styled(
-                                format!("  {}", truncate_ellipsis(&compact, excerpt_width)),
-                                s_dim,
-                            )),
-                        ]
-                    })
-                    .map(ListItem::new)
-                    .collect();
+                let items: Vec<ListItem> = match &view.results {
+                    SemanticResults::Papers(papers) => papers
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(rank, paper)| {
+                            let hit = paper.passages.first()?;
+                            let location = semantic_location(hit);
+                            let heading = if hit.headings.is_empty() {
+                                location
+                            } else if location.is_empty() {
+                                semantic_heading_text(&hit.headings)
+                            } else {
+                                format!(
+                                    "{} · {}",
+                                    semantic_heading_text(&hit.headings).trim_end(),
+                                    location
+                                )
+                            };
+                            let compact = hit.text.split_whitespace().collect::<Vec<_>>().join(" ");
+                            Some(ListItem::new(vec![
+                                Line::from(vec![
+                                    Span::styled(format!(" {:>2}. ", rank + 1), s_date),
+                                    Span::styled(format!("{:.3}  ", paper.similarity), s_hl),
+                                    Span::styled(paper.paper_title.as_str(), s_text),
+                                ]),
+                                Line::from(vec![
+                                    Span::styled(
+                                        format!(
+                                            "  {} passage{} ›",
+                                            paper.matching_passages,
+                                            if paper.matching_passages == 1 {
+                                                ""
+                                            } else {
+                                                "s"
+                                            }
+                                        ),
+                                        s_author,
+                                    ),
+                                    Span::styled(
+                                        if heading.is_empty() {
+                                            String::new()
+                                        } else {
+                                            format!(" · best match {heading}")
+                                        },
+                                        s_date,
+                                    ),
+                                ]),
+                                Line::from(Span::styled(
+                                    format!("  {}", truncate_ellipsis(&compact, excerpt_width)),
+                                    s_dim,
+                                )),
+                            ]))
+                        })
+                        .collect(),
+                    SemanticResults::Passages(passages) => passages
+                        .iter()
+                        .enumerate()
+                        .map(|(rank, hit)| {
+                            let location = semantic_location(hit);
+                            let heading = if hit.headings.is_empty() {
+                                String::new()
+                            } else {
+                                format!("  {}", semantic_heading_text(&hit.headings))
+                            };
+                            let compact = hit.text.split_whitespace().collect::<Vec<_>>().join(" ");
+                            ListItem::new(vec![
+                                Line::from(vec![
+                                    Span::styled(format!(" {:>2}. ", rank + 1), s_date),
+                                    Span::styled(format!("{:.3}  ", hit.similarity), s_hl),
+                                    Span::styled(hit.paper_title.as_str(), s_text),
+                                    Span::styled(
+                                        if location.is_empty() {
+                                            String::new()
+                                        } else {
+                                            format!(" · {location}")
+                                        },
+                                        s_hl,
+                                    ),
+                                ]),
+                                Line::from(Span::styled(heading, s_author)),
+                                Line::from(Span::styled(
+                                    format!("  {}", truncate_ellipsis(&compact, excerpt_width)),
+                                    s_dim,
+                                )),
+                            ])
+                        })
+                        .collect(),
+                };
                 let list = List::new(items)
                     .highlight_style(
                         Style::default()
@@ -2771,6 +3150,21 @@ fn draw_semantic_preview(f: &mut Frame, hit: &SearchHit, area: Rect, scroll: u16
     );
 }
 
+fn semantic_location(hit: &SearchHit) -> String {
+    match hit.pages.as_slice() {
+        [] => String::new(),
+        [page] => format!("p. {page}"),
+        pages => format!(
+            "pp. {}",
+            pages
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
 fn semantic_heading_text(headings: &[String]) -> String {
     format!("{}  ", headings.join(" › "))
 }
@@ -3275,6 +3669,18 @@ mod tests {
         assert_eq!(
             semantic_error_message(&error),
             "Semantic index was built with an older model; run `grimoire semantic-index`"
+        );
+    }
+
+    #[test]
+    fn missing_semantic_index_error_explains_how_to_build_it() {
+        let error = anyhow::anyhow!(
+            "Semantic index is not initialized. Run `grimoire semantic-index` first."
+        );
+
+        assert_eq!(
+            semantic_error_message(&error),
+            "Semantic index not built.\nRun `grimoire semantic-index` first."
         );
     }
 

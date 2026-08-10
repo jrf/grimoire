@@ -12,6 +12,7 @@
 - [ ] Expand unit tests (storage dir-naming, export rendering, dedup grouping) + CI hardening (`cargo audit`, `--locked`) #chore
 - [ ] `validate`: detect orphan PDFs on disk, structured (deserialize→edit→serialize) `--fix` #improvement
 - [ ] `grimoire related` via Semantic Scholar API #feature
+- [ ] Math-textbook retrieval: preserve LaTeX, headings, pages, and surrounding prose during extraction/chunking; combine semantic similarity with FTS for symbols, theorem names, and exact expressions; distinguish indexed passage counts from similarity matches #feature
 - [ ] APA/Chicago formatted citation output #feature
 
 ## Later

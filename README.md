@@ -56,7 +56,9 @@ grimoire backfill --pdfs-only     # only download missing PDFs (open-access)
 grimoire reindex                  # rebuild search index from filesystem
 grimoire semantic-index           # embed new or changed JSONL passages
 grimoire semantic-index --force   # rebuild every passage embedding
-grimoire semantic "retrieval limitations"  # ranked vector-similarity passage search
+grimoire semantic "retrieval limitations"  # papers ranked by their best passage
+grimoire semantic "retrieval limitations" --per-paper 3 # include top 3 passages per paper
+grimoire semantic "retrieval limitations" --group passages # raw passage ranking
 grimoire semantic "retrieval limitations" --offset 100 # fetch the next CLI page
 grimoire semantic "retrieval limitations" --all # explicitly return every result
 grimoire validate                 # check library integrity
@@ -71,7 +73,7 @@ grimoire completions fish         # emit a shell completion script
 | `j / k` | Move down / up |
 | `g / G` | Jump to top / bottom |
 | `/ or i` | Enter search mode |
-| `v` | Search indexed passages semantically |
+| `v` | Search indexed papers semantically |
 | `enter` | Open PDF (browse), confirm search (search) |
 | `e` | Edit info.toml |
 | `y` | Copy BibTeX |
@@ -90,9 +92,14 @@ grimoire completions fish         # emit a shell completion script
 | `?` | Help |
 | `q` | Quit |
 
-When browsing semantic results, `j / k` moves through passages, `space` expands
-the selected passage, `enter` opens its paper, `v` starts another semantic
-query, and `esc` returns to the paper browser.
+Semantic results start as one row per paper, ordered by that paper's strongest
+matching passage. Lowercase `p` toggles between the selected paper and its
+ranked passages; `l` or Right also opens them. Uppercase `P` toggles between
+grouped papers and the global raw-passage ranking. From either passage view,
+`h` or Left returns to the grouped paper results; `esc` also returns from a
+selected paper's passages. In every view, `j / k` moves, `space` expands the
+selected match, `enter` opens its PDF at the indexed page, and `v` starts
+another semantic query.
 
 ## Agentic CLI
 
@@ -106,6 +113,8 @@ grimoire --json list --query "visual representation" --tag video
 grimoire --json show vaswani-2017-attention
 grimoire --json search "transformer architecture"
 grimoire --json semantic "limitations of self-supervised video models"
+grimoire --json semantic "limitations" --per-paper 3
+grimoire --json semantic "limitations" --group passages
 grimoire --json semantic "limitations" --limit 100 --offset 100
 grimoire --json semantic "limitations" --all
 grimoire --json cite vaswani-2017-attention --format typst
@@ -168,7 +177,7 @@ browser = ["open"]          # URL opener; defaults to $BROWSER or the OS opener
 theme = "~/.config/themes/tokyo-night-moon.toml"
 theme_catalog = "~/.config/themes/catalog.toml"
 layout = "full"            # full (default), wide, tall, or auto; auto detects wide/tall
-# semantic_results = 25     # optional cap; omitted or zero returns all passages
+# semantic_results = 25     # optional TUI result cap; omitted or zero returns all
 ```
 
 `theme` is loaded directly. `theme_catalog` contains an explicit `themes = [...]`
@@ -242,14 +251,24 @@ metadata.
 Embeddings use a pinned, Q4 ONNX export of Google's on-device EmbeddingGemma
 300M model. The model is downloaded on first use and cached locally; document
 text is not sent to an embedding API. Run `grimoire semantic "your
-natural-language query"` to print ranked results, or press `v` in the TUI
-to browse all ranked passages with headings and page numbers. Set
-`semantic_results` to a positive number only if you want to cap TUI results.
-The TUI hydrates 100 passages initially and automatically loads another page
-near the end of the current results; its status reports loaded and total counts.
-The CLI returns 100 results by default, accepts `--limit` and `--offset` for
-paging, and requires `--all` for an intentionally unbounded response. JSON
-output includes `total`, `offset`, `returned`, and `next_offset`. Re-run
+natural-language query"` to rank papers by their strongest passage. Add
+`--per-paper 3` to include more evidence per paper, or `--group passages` to
+return the original global passage ranking.
+
+The TUI uses the same paper-first ranking. Press `v` to search; lowercase `p`
+toggles between a paper and its ranked passages, while uppercase `P` toggles
+between grouped papers and the global raw-passage ranking. `l` or Right also
+opens a paper, and `h` or Left returns from either passage view. Set
+`semantic_results` to a positive number only if you want to cap results in any
+TUI view. It hydrates 100 papers or passages initially and automatically loads
+another page near the end; its status names the active unit and reports loaded
+and total counts.
+
+The CLI returns 100 papers by default, accepts `--limit` and `--offset` for
+paging, and requires `--all` for an intentionally unbounded response. Grouped
+JSON includes `total_passages` alongside `total`, `offset`, `returned`, and
+`next_offset`; each paper includes its best score, match count, and requested
+passages. Re-run
 `semantic-index` after
 regenerating the JSONL files; unchanged
 sources are skipped automatically. Changing the embedding profile triggers a

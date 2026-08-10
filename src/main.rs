@@ -17,10 +17,16 @@ mod validate;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
 use config::Config;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum SemanticGroup {
+    Papers,
+    Passages,
+}
 
 #[derive(Parser)]
 #[command(name = "grimoire", version, about = "A fast TUI reference manager")]
@@ -169,12 +175,12 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// Search indexed passages by semantic similarity
+    /// Search indexed papers or passages by semantic similarity
     Semantic {
         /// Natural-language search query
         #[arg(required = true)]
         query: Vec<String>,
-        /// Number of passages to return (defaults to 100)
+        /// Number of papers or passages to return (defaults to 100)
         #[arg(short, long, conflicts_with = "all")]
         limit: Option<usize>,
         /// Zero-based result offset
@@ -183,6 +189,12 @@ enum Command {
         /// Return every result from the offset onward
         #[arg(long)]
         all: bool,
+        /// Group results by paper, or return the raw passage ranking
+        #[arg(long, value_enum, default_value = "papers")]
+        group: SemanticGroup,
+        /// Number of ranked passages to include with each paper result
+        #[arg(long)]
+        per_paper: Option<usize>,
     },
     /// Validate library integrity (missing PDFs, junk files, temp names)
     Validate {
@@ -535,25 +547,45 @@ fn run(cli: Cli) -> Result<()> {
             limit,
             offset,
             all,
+            group,
+            per_paper,
         }) => {
             let query = query.join(" ");
-            let ranking = semantic::rank(&library, &query, &config.embedding)?;
             anyhow::ensure!(
-                offset <= ranking.total(),
-                "Semantic search offset {offset} exceeds {} results",
-                ranking.total()
+                group == SemanticGroup::Papers || per_paper.is_none(),
+                "--per-paper can only be used with --group papers"
             );
-            let page_limit = if all {
-                ranking.total().saturating_sub(offset).max(1)
-            } else {
-                limit.unwrap_or(semantic::DEFAULT_PAGE_SIZE)
-            };
-            let page = ranking.page(&library, offset, page_limit)?;
-            if cli.json {
-                cli::print_json(page)
-            } else {
-                semantic::print_page(&page);
-                Ok(())
+            let ranking = semantic::rank(&library, &query, &config.embedding)?;
+            match group {
+                SemanticGroup::Papers => {
+                    let per_paper = per_paper.unwrap_or(1);
+                    let page_limit = if all {
+                        ranking.paper_total().saturating_sub(offset).max(1)
+                    } else {
+                        limit.unwrap_or(semantic::DEFAULT_PAGE_SIZE)
+                    };
+                    let page = ranking.paper_page(&library, offset, page_limit, per_paper)?;
+                    if cli.json {
+                        cli::print_json(page)
+                    } else {
+                        semantic::print_paper_page(&page);
+                        Ok(())
+                    }
+                }
+                SemanticGroup::Passages => {
+                    let page_limit = if all {
+                        ranking.total().saturating_sub(offset).max(1)
+                    } else {
+                        limit.unwrap_or(semantic::DEFAULT_PAGE_SIZE)
+                    };
+                    let page = ranking.page(&library, offset, page_limit)?;
+                    if cli.json {
+                        cli::print_json(page)
+                    } else {
+                        semantic::print_page(&page);
+                        Ok(())
+                    }
+                }
             }
         }
         Some(Command::Validate { fix }) => {
@@ -941,14 +973,19 @@ fn add_from_url(library: &Path, url: &str, force: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command};
+    use super::{Cli, Command, SemanticGroup};
     use clap::Parser;
 
     #[test]
     fn semantic_cli_defaults_to_first_page_and_supports_explicit_paging() {
         let cli = Cli::try_parse_from(["grimoire", "semantic", "synthetic query"]).unwrap();
         let Some(Command::Semantic {
-            limit, offset, all, ..
+            limit,
+            offset,
+            all,
+            group,
+            per_paper,
+            ..
         }) = cli.command
         else {
             panic!("semantic command was not parsed");
@@ -956,6 +993,8 @@ mod tests {
         assert_eq!(limit, None);
         assert_eq!(offset, 0);
         assert!(!all);
+        assert_eq!(group, SemanticGroup::Papers);
+        assert_eq!(per_paper, None);
 
         let cli = Cli::try_parse_from([
             "grimoire",
@@ -972,6 +1011,19 @@ mod tests {
         };
         assert_eq!(limit, Some(25));
         assert_eq!(offset, 100);
+
+        let cli = Cli::try_parse_from([
+            "grimoire",
+            "semantic",
+            "synthetic query",
+            "--group",
+            "passages",
+        ])
+        .unwrap();
+        let Some(Command::Semantic { group, .. }) = cli.command else {
+            panic!("semantic command was not parsed");
+        };
+        assert_eq!(group, SemanticGroup::Passages);
 
         assert!(
             Cli::try_parse_from([
