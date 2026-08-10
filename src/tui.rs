@@ -2113,7 +2113,7 @@ fn draw(f: &mut Frame, app: &mut App) {
                         let heading = if hit.headings.is_empty() {
                             String::new()
                         } else {
-                            format!("  {}", hit.headings.join(" › "))
+                            format!("  {}", semantic_heading_text(&hit.headings))
                         };
                         let compact = hit.text.split_whitespace().collect::<Vec<_>>().join(" ");
                         vec![
@@ -2635,7 +2635,10 @@ fn draw_semantic_preview(f: &mut Frame, hit: &SearchHit, area: Rect, scroll: u16
         ),
     ]));
     if !hit.headings.is_empty() {
-        lines.push(Line::from(Span::styled(hit.headings.join(" › "), s.author)));
+        lines.push(Line::from(Span::styled(
+            semantic_heading_text(&hit.headings),
+            s.author,
+        )));
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(hit.text.as_str(), s.dim)));
@@ -2651,6 +2654,10 @@ fn draw_semantic_preview(f: &mut Frame, hit: &SearchHit, area: Rect, scroll: u16
             .scroll((scroll, 0)),
         area,
     );
+}
+
+fn semantic_heading_text(headings: &[String]) -> String {
+    format!("{}  ", headings.join(" › "))
 }
 
 fn draw_preview(f: &mut Frame, app: &App, area: ratatui::layout::Rect, s: &Styles) {
@@ -3178,7 +3185,10 @@ mod tests {
     use std::path::Path;
     use std::process::Command;
 
-    use super::{LayoutMode, picker_rect, prepare_reader_command, semantic_error_message};
+    use super::{
+        LayoutMode, picker_rect, prepare_reader_command, semantic_error_message,
+        semantic_heading_text,
+    };
     use ratatui::layout::Rect;
 
     #[test]
@@ -3254,6 +3264,14 @@ mod tests {
         assert_eq!(
             semantic_error_message(&error),
             "Semantic index was built with an older model; run `grimoire semantic-index`"
+        );
+    }
+
+    #[test]
+    fn semantic_headings_leave_space_before_passage_text() {
+        assert_eq!(
+            semantic_heading_text(&["1 INTRODUCTION".to_string(), "Background".to_string()]),
+            "1 INTRODUCTION › Background  "
         );
     }
 }
