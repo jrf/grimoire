@@ -2,6 +2,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
+use serde::Serialize;
 
 use crate::metadata;
 use crate::storage;
@@ -158,8 +159,8 @@ impl Index {
         Ok(())
     }
 
-    #[allow(dead_code)]
-    pub fn search(&self, query: &str) -> Result<Vec<SearchHit>> {
+    pub fn search_with_limit(&self, query: &str, limit: Option<usize>) -> Result<Vec<SearchHit>> {
+        anyhow::ensure!(!query.trim().is_empty(), "Search query cannot be empty");
         let fts_query = query
             .split_whitespace()
             .map(|w| format!("\"{}\"", w.replace('"', "")))
@@ -172,8 +173,7 @@ impl Index {
              FROM reference_fts fts
              JOIN reference r ON r.rowid = fts.rowid
              WHERE reference_fts MATCH ?1
-             ORDER BY rank
-             LIMIT 50",
+             ORDER BY rank",
         )?;
 
         let hits = stmt.query_map(params![fts_query], |row| {
@@ -189,6 +189,9 @@ impl Index {
         let mut results = Vec::new();
         for hit in hits {
             results.push(hit?);
+        }
+        if let Some(limit) = limit {
+            results.truncate(limit);
         }
         Ok(results)
     }
@@ -213,12 +216,11 @@ fn find_pdf(dir: &Path, r: &crate::model::Reference) -> Option<std::path::PathBu
     })
 }
 
-#[allow(dead_code)]
+#[derive(Debug, Serialize)]
 pub struct SearchHit {
     pub dir_name: String,
     pub title: String,
     pub authors: String,
     pub year: Option<u16>,
-    #[allow(dead_code)]
     pub snippet: String,
 }

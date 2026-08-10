@@ -8,6 +8,7 @@ use fastembed::{
     UserDefinedEmbeddingModel,
 };
 use rusqlite::{Connection, params};
+use serde::Serialize;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
@@ -53,7 +54,21 @@ struct IndexReport {
     malformed: usize,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
+pub struct IndexSummary {
+    pub files: usize,
+    pub passages: usize,
+    pub embedded_files: usize,
+    pub embedded_passages: usize,
+    pub unchanged_files: usize,
+    pub removed_files: usize,
+    pub skipped_rows: usize,
+    pub malformed_rows: usize,
+    pub dimensions: usize,
+    pub up_to_date: bool,
+}
+
+#[derive(Debug, Serialize)]
 pub struct SearchHit {
     pub dir_name: String,
     pub paper_title: String,
@@ -65,7 +80,12 @@ pub struct SearchHit {
     pub similarity: f32,
 }
 
-pub fn build(library: &Path, config: &EmbeddingConfig, force: bool) -> Result<()> {
+pub fn build(
+    library: &Path,
+    config: &EmbeddingConfig,
+    force: bool,
+    quiet: bool,
+) -> Result<IndexSummary> {
     validate_embedding_config(config)?;
     let model_id = model_id(config)?;
     let (sources, report) = collect_sources(library)?;
@@ -92,11 +112,25 @@ pub fn build(library: &Path, config: &EmbeddingConfig, force: bool) -> Result<()
         ),
     };
     if changed_sources.is_empty() && deleted.is_empty() {
-        println!(
-            "Semantic index is up to date ({} passages from {} files).",
-            report.chunks, report.files
-        );
-        return Ok(());
+        let (_, dimension, _) = index_metadata(&conn)?;
+        if !quiet {
+            println!(
+                "Semantic index is up to date ({} passages from {} files).",
+                report.chunks, report.files
+            );
+        }
+        return Ok(IndexSummary {
+            files: report.files,
+            passages: report.chunks,
+            embedded_files: 0,
+            embedded_passages: 0,
+            unchanged_files: report.files,
+            removed_files: 0,
+            skipped_rows: report.skipped,
+            malformed_rows: report.malformed,
+            dimensions: dimension,
+            up_to_date: true,
+        });
     }
 
     let chunks: Vec<&ChunkRecord> = changed_sources
@@ -108,12 +142,14 @@ pub fn build(library: &Path, config: &EmbeddingConfig, force: bool) -> Result<()
         let (_, dimension, _) = index_metadata(&conn)?;
         (Vec::new(), dimension)
     } else {
-        println!(
-            "Embedding {} new or changed passages from {} JSONL files with {}...",
-            chunks.len(),
-            changed_sources.len(),
-            config.repo
-        );
+        if !quiet {
+            println!(
+                "Embedding {} new or changed passages from {} JSONL files with {}...",
+                chunks.len(),
+                changed_sources.len(),
+                config.repo
+            );
+        }
         let mut model = embedding_model(config, true)?;
         let texts: Vec<String> = chunks
             .iter()
@@ -143,17 +179,30 @@ pub fn build(library: &Path, config: &EmbeddingConfig, force: bool) -> Result<()
         update_index(&conn, &changed_sources, &deleted, &embeddings)?;
     }
     let reused = report.files.saturating_sub(changed_sources.len());
-    println!(
-        "Indexed {} passages from {} files ({} unchanged, {} removed, {} skipped, {} malformed; {} dimensions).",
-        report.chunks,
-        report.files,
-        reused,
-        deleted.len(),
-        report.skipped,
-        report.malformed,
-        dimension
-    );
-    Ok(())
+    if !quiet {
+        println!(
+            "Indexed {} passages from {} files ({} unchanged, {} removed, {} skipped, {} malformed; {} dimensions).",
+            report.chunks,
+            report.files,
+            reused,
+            deleted.len(),
+            report.skipped,
+            report.malformed,
+            dimension
+        );
+    }
+    Ok(IndexSummary {
+        files: report.files,
+        passages: report.chunks,
+        embedded_files: changed_sources.len(),
+        embedded_passages: chunks.len(),
+        unchanged_files: reused,
+        removed_files: deleted.len(),
+        skipped_rows: report.skipped,
+        malformed_rows: report.malformed,
+        dimensions: dimension,
+        up_to_date: false,
+    })
 }
 
 fn embed_passages(
