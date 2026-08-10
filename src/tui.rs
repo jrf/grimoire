@@ -107,6 +107,7 @@ struct SemanticView {
     results: SemanticResults,
     scope: SemanticScope,
     ranking: Option<SearchRanking>,
+    error: Option<String>,
     total: usize,
     list_state: ListState,
 }
@@ -506,6 +507,7 @@ fn run_event_loop(terminal: &mut Term, app: &mut App, tty_ctl: &mut File) -> Res
                         view.results = SemanticResults::Papers(load.results);
                         view.scope = SemanticScope::Papers;
                         view.ranking = Some(load.ranking);
+                        view.error = None;
                         view.total = load.total;
                         view.list_state
                             .select((!view.results.is_empty()).then_some(0));
@@ -515,14 +517,17 @@ fn run_event_loop(terminal: &mut Term, app: &mut App, tty_ctl: &mut File) -> Res
                 }
                 Ok(Err(error)) => {
                     app.semantic_rx = None;
-                    app.flash = Some((error, std::time::Instant::now()));
+                    if let Some(view) = app.semantic_view.as_mut() {
+                        view.error = Some(error);
+                    }
+                    continue;
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     app.semantic_rx = None;
-                    app.flash = Some((
-                        "Semantic search failed".to_string(),
-                        std::time::Instant::now(),
-                    ));
+                    if let Some(view) = app.semantic_view.as_mut() {
+                        view.error = Some("Semantic search failed".to_string());
+                    }
+                    continue;
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
             }
@@ -1109,6 +1114,7 @@ impl App {
             results: SemanticResults::Papers(Vec::new()),
             scope: SemanticScope::Papers,
             ranking: None,
+            error: None,
             total: 0,
             list_state: ListState::default(),
         });
@@ -1986,7 +1992,11 @@ impl App {
 
 fn semantic_error_message(error: &anyhow::Error) -> String {
     let detail = format!("{error:#}");
-    if detail.contains("Semantic index uses model") {
+    if detail.contains("Semantic index is not initialized")
+        || detail.contains("Semantic index is empty")
+    {
+        "Semantic index not built.\nRun `grimoire semantic-index` first.".to_string()
+    } else if detail.contains("Semantic index uses model") {
         "Semantic index was built with an older model; run `grimoire semantic-index`".to_string()
     } else {
         format!("Semantic search: {detail}")
@@ -2475,6 +2485,27 @@ fn draw(f: &mut Frame, app: &mut App) {
                         s_dim,
                     )))
                     .alignment(ratatui::layout::Alignment::Center),
+                    list_inner,
+                );
+            } else if let Some(error) = &view.error {
+                let lines = error
+                    .lines()
+                    .enumerate()
+                    .map(|(index, line)| {
+                        Line::from(Span::styled(
+                            line,
+                            if index == 0 {
+                                s_hl.add_modifier(Modifier::BOLD)
+                            } else {
+                                s_text
+                            },
+                        ))
+                    })
+                    .collect::<Vec<_>>();
+                f.render_widget(
+                    Paragraph::new(lines)
+                        .alignment(ratatui::layout::Alignment::Center)
+                        .wrap(Wrap { trim: true }),
                     list_inner,
                 );
             } else if view.results.is_empty() {
@@ -3638,6 +3669,18 @@ mod tests {
         assert_eq!(
             semantic_error_message(&error),
             "Semantic index was built with an older model; run `grimoire semantic-index`"
+        );
+    }
+
+    #[test]
+    fn missing_semantic_index_error_explains_how_to_build_it() {
+        let error = anyhow::anyhow!(
+            "Semantic index is not initialized. Run `grimoire semantic-index` first."
+        );
+
+        assert_eq!(
+            semantic_error_message(&error),
+            "Semantic index not built.\nRun `grimoire semantic-index` first."
         );
     }
 
