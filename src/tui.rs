@@ -22,7 +22,7 @@ use crate::config::Config as AppConfig;
 use crate::index;
 use crate::metadata;
 use crate::model::Reference;
-use crate::semantic::{self, SearchHit};
+use crate::semantic::{self, SearchHit, SearchRanking};
 use crate::storage;
 use crate::theme::{self, Theme};
 use crate::validate;
@@ -99,13 +99,21 @@ pub struct App {
     validate_popup: Option<ValidatePopup>,
     semantic_input: Option<String>,
     semantic_view: Option<SemanticView>,
-    semantic_rx: Option<mpsc::Receiver<std::result::Result<Vec<SearchHit>, String>>>,
+    semantic_rx: Option<mpsc::Receiver<std::result::Result<SemanticLoad, String>>>,
 }
 
 struct SemanticView {
     query: String,
     results: Vec<SearchHit>,
+    ranking: Option<SearchRanking>,
+    total: usize,
     list_state: ListState,
+}
+
+struct SemanticLoad {
+    ranking: SearchRanking,
+    results: Vec<SearchHit>,
+    total: usize,
 }
 
 struct ValidatePopup {
@@ -439,10 +447,12 @@ fn run_event_loop(terminal: &mut Term, app: &mut App, tty_ctl: &mut File) -> Res
 
         if let Some(ref rx) = app.semantic_rx {
             match rx.try_recv() {
-                Ok(Ok(results)) => {
+                Ok(Ok(load)) => {
                     app.semantic_rx = None;
                     if let Some(view) = app.semantic_view.as_mut() {
-                        view.results = results;
+                        view.results = load.results;
+                        view.ranking = Some(load.ranking);
+                        view.total = load.total;
                         view.list_state
                             .select((!view.results.is_empty()).then_some(0));
                     }
@@ -1018,16 +1028,55 @@ impl App {
         self.semantic_view = Some(SemanticView {
             query,
             results: Vec::new(),
+            ranking: None,
+            total: 0,
             list_state: ListState::default(),
         });
         self.preview_overlay = false;
         self.preview_scroll = 0;
 
         std::thread::spawn(move || {
-            let result = semantic::search_silent(&library, &worker_query, limit, &embedding)
-                .map_err(|error| semantic_error_message(&error));
+            let result = (|| {
+                let ranking = semantic::rank_silent(&library, &worker_query, &embedding)?;
+                let total = limit.map_or_else(|| ranking.total(), |cap| cap.min(ranking.total()));
+                let page_size = semantic::DEFAULT_PAGE_SIZE.min(total).max(1);
+                let page = ranking.page(&library, 0, page_size)?;
+                Ok(SemanticLoad {
+                    ranking,
+                    results: page.hits,
+                    total,
+                })
+            })()
+            .map_err(|error: anyhow::Error| semantic_error_message(&error));
             let _ = tx.send(result);
         });
+    }
+
+    fn maybe_load_more_semantic(&mut self) {
+        let library = self.config.library_dir();
+        let result = {
+            let Some(view) = self.semantic_view.as_mut() else {
+                return;
+            };
+            let selected = view.list_state.selected().unwrap_or(0);
+            if !should_load_more_semantic(selected, view.results.len(), view.total) {
+                return;
+            }
+            let Some(ranking) = view.ranking.as_ref() else {
+                return;
+            };
+            let offset = view.results.len();
+            let page_size = semantic::DEFAULT_PAGE_SIZE.min(view.total - offset);
+            ranking
+                .page(&library, offset, page_size)
+                .map(|page| view.results.extend(page.hits))
+        };
+        if let Err(error) = result {
+            self.flash = Some((
+                format!("Could not load more semantic results: {error}"),
+                std::time::Instant::now(),
+            ));
+        }
     }
 
     fn clear_semantic(&mut self) {
@@ -1133,6 +1182,7 @@ impl App {
                     .select(Some((selected + 1).min(view.results.len() - 1)));
             }
             self.preview_scroll = 0;
+            self.maybe_load_more_semantic();
             return;
         }
         if self.filtered_indices.is_empty() {
@@ -1170,6 +1220,7 @@ impl App {
                     .select(Some((selected + lines).min(view.results.len() - 1)));
             }
             self.preview_scroll = 0;
+            self.maybe_load_more_semantic();
             return;
         }
         if self.filtered_indices.is_empty() {
@@ -1215,6 +1266,7 @@ impl App {
             view.list_state
                 .select((!view.results.is_empty()).then_some(view.results.len() - 1));
             self.preview_scroll = 0;
+            self.maybe_load_more_semantic();
             return;
         }
         if !self.filtered_indices.is_empty() {
@@ -1976,11 +2028,6 @@ fn draw(f: &mut Frame, app: &mut App) {
     }
 
     // Status bar as bottom title of list
-    let count_str = if let Some(view) = &app.semantic_view {
-        format!(" {} results ", view.results.len())
-    } else {
-        format!(" {}/{} ", app.filtered_indices.len(), app.entries.len())
-    };
     let mode_indicator = if app.semantic_input.is_some() || app.semantic_view.is_some() {
         Span::styled(
             if app.semantic_rx.is_some() {
@@ -2021,24 +2068,70 @@ fn draw(f: &mut Frame, app: &mut App) {
             ),
         }
     };
-    let mode_hint = if app.semantic_input.is_some() {
-        " enter search  esc cancel "
-    } else if app.semantic_view.is_some() {
-        " enter open  v edit  esc papers "
-    } else if app.add_input.is_some() {
-        " enter add  esc cancel "
+    let mut bottom_spans = vec![mode_indicator];
+    if let Some(view) = &app.semantic_view {
+        bottom_spans.extend([
+            Span::styled(
+                format!(" {}", view.results.len()),
+                s_date.add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" loaded · ", s_text),
+            Span::styled(view.total.to_string(), s_hl.add_modifier(Modifier::BOLD)),
+            Span::styled(" total ", s_text),
+        ]);
     } else {
-        match (app.input_mode, &app.mode) {
-            (InputMode::Search, _) => " esc browse ",
-            (InputMode::Browse, Mode::Browse) => " / search  c clear  q quit ",
-            (InputMode::Browse, Mode::Cite { .. }) => " / search  c clear  q quit ",
-        }
-    };
-    let mut bottom_spans = vec![mode_indicator, Span::styled(count_str, s_muted)];
+        bottom_spans.extend([
+            Span::styled(
+                format!(" {}", app.filtered_indices.len()),
+                s_date.add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("/", s_text),
+            Span::styled(
+                app.entries.len().to_string(),
+                s_hl.add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" ", s_text),
+        ]);
+    }
     if let Some(flash) = app.flash_message() {
         bottom_spans.push(Span::styled(format!(" {} ", flash), s_hl));
+    } else if app.semantic_view.is_some() && app.semantic_input.is_none() {
+        bottom_spans.extend([
+            Span::styled(" enter", s_link.add_modifier(Modifier::BOLD)),
+            Span::styled(" open  ", s_text),
+            Span::styled("v", s_author.add_modifier(Modifier::BOLD)),
+            Span::styled(" edit  ", s_text),
+            Span::styled("esc", s_hl.add_modifier(Modifier::BOLD)),
+            Span::styled(" papers ", s_text),
+        ]);
+    } else if app.semantic_input.is_some() {
+        bottom_spans.extend([
+            Span::styled(" enter", s_link.add_modifier(Modifier::BOLD)),
+            Span::styled(" search  ", s_text),
+            Span::styled("esc", s_hl.add_modifier(Modifier::BOLD)),
+            Span::styled(" cancel ", s_text),
+        ]);
+    } else if app.add_input.is_some() {
+        bottom_spans.extend([
+            Span::styled(" enter", s_link.add_modifier(Modifier::BOLD)),
+            Span::styled(" add  ", s_text),
+            Span::styled("esc", s_hl.add_modifier(Modifier::BOLD)),
+            Span::styled(" cancel ", s_text),
+        ]);
+    } else if app.input_mode == InputMode::Search {
+        bottom_spans.extend([
+            Span::styled(" esc", s_hl.add_modifier(Modifier::BOLD)),
+            Span::styled(" browse ", s_text),
+        ]);
     } else {
-        bottom_spans.push(Span::styled(mode_hint, s_muted));
+        bottom_spans.extend([
+            Span::styled(" /", s_link.add_modifier(Modifier::BOLD)),
+            Span::styled(" search  ", s_text),
+            Span::styled("c", s_author.add_modifier(Modifier::BOLD)),
+            Span::styled(" clear  ", s_text),
+            Span::styled("q", s_hl.add_modifier(Modifier::BOLD)),
+            Span::styled(" quit ", s_text),
+        ]);
     }
     let bottom_left = Line::from(bottom_spans);
 
@@ -2597,6 +2690,11 @@ fn draw(f: &mut Frame, app: &mut App) {
     }
 }
 
+fn should_load_more_semantic(selected: usize, loaded: usize, total: usize) -> bool {
+    const LOAD_THRESHOLD: usize = 10;
+    loaded < total && selected.saturating_add(LOAD_THRESHOLD) >= loaded
+}
+
 struct Styles {
     text: Style,
     dim: Style,
@@ -3091,7 +3189,7 @@ mod tests {
 
     use super::{
         LayoutMode, picker_rect, prepare_reader_command, semantic_error_message,
-        semantic_heading_text, semantic_passage_lines,
+        semantic_heading_text, semantic_passage_lines, should_load_more_semantic,
     };
     use ratatui::layout::Rect;
 
@@ -3193,5 +3291,12 @@ mod tests {
                 "Second paragraph."
             ]
         );
+    }
+
+    #[test]
+    fn semantic_results_load_lazily_near_the_page_end() {
+        assert!(!should_load_more_semantic(20, 100, 14_887));
+        assert!(should_load_more_semantic(90, 100, 14_887));
+        assert!(!should_load_more_semantic(99, 100, 100));
     }
 }
