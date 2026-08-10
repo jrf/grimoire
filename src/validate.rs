@@ -1,10 +1,12 @@
 use std::path::Path;
 
 use anyhow::Result;
+use serde::Serialize;
 
 use crate::model::Reference;
 use crate::storage;
 
+#[derive(Serialize)]
 pub struct ValidateResult {
     pub total: usize,
     pub fixed: usize,

@@ -37,6 +37,16 @@ grimoire add paper.pdf            # import local PDF
 grimoire add 1706.03762 2201.1234 # batch import (each input handled independently)
 grimoire add --force 1706.03762   # import even if a matching DOI/title already exists
 grimoire cite --format typst      # pick a reference, output @cite-key
+grimoire list --tag video         # list references without opening the TUI
+grimoire show vaswani-2017-attention # show one reference by exact key
+grimoire search "attention model" # lexical full-text search
+grimoire path vaswani-2017-attention # print the local PDF path
+grimoire update vaswani-2017-attention --add-tag foundational # preview metadata edit
+grimoire update vaswani-2017-attention --add-tag foundational --apply # write it
+grimoire enrich vaswani-2017-attention # preview missing metadata fetched from sources
+grimoire enrich vaswani-2017-attention --apply # write fetched metadata
+grimoire dedup                    # inspect duplicate groups without changing files
+grimoire dedup --keep vaswani-2017-attention --apply # move rejected copies to .trash
 grimoire export --format yaml     # dump all references to stdout as YAML
 grimoire export --format hayagriva # ...or json / bibtex / hayagriva (Typst)
 grimoire export -f bibtex --tag video -o refs.bib  # filter by tag, write to a file
@@ -77,6 +87,40 @@ grimoire completions fish         # emit a shell completion script
 | `L` | Cycle layout (full/wide/tall) |
 | `?` | Help |
 | `q` | Quit |
+
+When browsing semantic results, `j / k` moves through passages, `space` expands
+the selected passage, `enter` opens its paper, `v` starts another semantic
+query, and `esc` returns to the paper browser.
+
+## Agentic CLI
+
+Core library browse and maintenance actions have noninteractive counterparts;
+theme selection, layout changes, and passage expansion remain presentation-only
+TUI actions. Use exact keys from `list`, `search`, or `semantic` to avoid
+ambiguous selection:
+
+```sh
+grimoire --json list --query "visual representation" --tag video
+grimoire --json show vaswani-2017-attention
+grimoire --json search "transformer architecture"
+grimoire --json semantic "limitations of self-supervised video models"
+grimoire --json cite vaswani-2017-attention --format typst
+grimoire --json path vaswani-2017-attention
+grimoire --json validate
+grimoire --json backfill --check
+```
+
+`--json` writes one stable envelope to stdout with `ok`, `data`, `warnings`,
+and `errors` fields. Diagnostics and download progress go to stderr. `export`
+is the exception because it emits the requested interchange format directly;
+use `export --format json` for machine-readable export data.
+
+Metadata and filesystem mutations are guarded. `update` and `enrich` show a
+dry-run diff unless `--apply` is present. `dedup` only removes entries when each
+duplicate group has an explicit `--keep <key>` and `--apply`; removed directories
+are moved to the library's `.trash` directory. `validate --fix`, `backfill`,
+`reindex`, `semantic-index`, and `add` retain their command-specific mutation
+semantics.
 
 ## Library layout
 

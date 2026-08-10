@@ -1583,8 +1583,12 @@ impl App {
         // Write to disk by directory path (stable), independent of the entry's
         // current position in the list — which may have shifted while the
         // background fetch was in flight.
-        let _ = metadata::write_info(&ep.dir, &ep.updated);
-        crate::index_reference(&library, &ep.dir, &ep.updated);
+        if let Err(error) = metadata::write_info(&ep.dir, &ep.updated)
+            .and_then(|()| crate::index_reference(&library, &ep.dir, &ep.updated))
+        {
+            self.flash = Some((format!("Enrich failed: {error}"), std::time::Instant::now()));
+            return;
+        }
         if let Some(idx) = self.entries.iter().position(|e| e.dir == ep.dir) {
             self.update_entry_display(idx, ep.updated);
         }
@@ -2822,7 +2826,7 @@ fn wrap_text(s: &str, width: usize) -> Vec<String> {
 
 fn run_dedup(terminal: &mut Term, app: &mut App) -> Result<()> {
     let library = app.config.library_dir();
-    let groups = find_duplicate_groups(&library)?;
+    let groups = crate::dedup::find_duplicate_paths(&library)?;
     if groups.is_empty() {
         app.flash = Some(("No duplicates found".to_string(), std::time::Instant::now()));
         return Ok(());
@@ -2874,7 +2878,8 @@ fn run_dedup(terminal: &mut Term, app: &mut App) -> Result<()> {
                                 // Uniquify: a same-named dir may already sit in
                                 // .trash from a previous dedup, and renaming onto
                                 // an existing directory fails with ENOTEMPTY.
-                                let dest = unique_trash_path(&trash_dir, &entry.dir_name);
+                                let dest =
+                                    crate::dedup::unique_trash_path(&trash_dir, &entry.dir_name);
                                 std::fs::rename(&entry.path, &dest)?;
                                 removed += 1;
                             }
@@ -2895,18 +2900,6 @@ fn run_dedup(terminal: &mut Term, app: &mut App) -> Result<()> {
     app.flash = Some((msg, std::time::Instant::now()));
     terminal.clear()?;
     Ok(())
-}
-
-/// Pick a destination under `.trash` that doesn't already exist, suffixing
-/// `-1`, `-2`, ... on collision so moving a duplicate never fails with ENOTEMPTY.
-fn unique_trash_path(trash_dir: &Path, name: &str) -> PathBuf {
-    let mut dest = trash_dir.join(name);
-    let mut n = 1;
-    while dest.exists() {
-        dest = trash_dir.join(format!("{name}-{n}"));
-        n += 1;
-    }
-    dest
 }
 
 struct DedupEntry {
@@ -2935,7 +2928,7 @@ impl DedupEntry {
             files: vec![],
             r#abstract: None,
         });
-        let score = metadata_score_ref(&reference);
+        let score = crate::dedup::metadata_score(&reference);
         let has_pdf = path
             .read_dir()
             .map(|rd| {
@@ -2954,119 +2947,6 @@ impl DedupEntry {
             has_pdf,
         }
     }
-}
-
-fn metadata_score_ref(r: &Reference) -> u32 {
-    let mut score = 0u32;
-    if !r.title.is_empty() {
-        score += 1;
-    }
-    if !r.authors.is_empty() {
-        score += 1;
-    }
-    if r.year.is_some() && r.year != Some(0) {
-        score += 1;
-    }
-    if r.doi.is_some() {
-        score += 1;
-    }
-    if r.arxiv.is_some() {
-        score += 1;
-    }
-    if r.journal.is_some() {
-        score += 1;
-    }
-    if !r.tags.is_empty() {
-        score += 1;
-    }
-    if !r.files.is_empty() {
-        score += 1;
-    }
-    if r.r#abstract.is_some() {
-        score += 1;
-    }
-    score
-}
-
-// Union-find: any two references sharing a normalized title OR a normalized
-// DOI belong to the same duplicate group. Merging both keys into one component
-// (rather than grouping by title then DOI separately) means a paper linked to a
-// group by DOI is caught even when its title differs, and vice versa.
-fn uf_find(parent: &mut [usize], mut x: usize) -> usize {
-    while parent[x] != x {
-        parent[x] = parent[parent[x]];
-        x = parent[x];
-    }
-    x
-}
-
-fn uf_union(parent: &mut [usize], a: usize, b: usize) {
-    let ra = uf_find(parent, a);
-    let rb = uf_find(parent, b);
-    if ra != rb {
-        parent[ra] = rb;
-    }
-}
-
-fn find_duplicate_groups(library: &Path) -> Result<Vec<Vec<PathBuf>>> {
-    use std::collections::HashMap;
-
-    let dirs = storage::list_ref_dirs(library)?;
-    let mut parent: Vec<usize> = (0..dirs.len()).collect();
-
-    // First directory seen for each normalized title / DOI; subsequent matches
-    // union into it. Directories whose info.toml fails to parse are simply
-    // never keyed, so they stay singletons and drop out below.
-    let mut first_by_title: HashMap<String, usize> = HashMap::new();
-    let mut first_by_doi: HashMap<String, usize> = HashMap::new();
-
-    for (i, dir) in dirs.iter().enumerate() {
-        let r = match metadata::read_info(dir) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-
-        let title = r.title.trim().to_lowercase();
-        if !title.is_empty() {
-            match first_by_title.get(&title) {
-                Some(&j) => uf_union(&mut parent, i, j),
-                None => {
-                    first_by_title.insert(title, i);
-                }
-            }
-        }
-
-        if let Some(ref doi) = r.doi {
-            let doi = doi.trim().to_lowercase();
-            if !doi.is_empty() {
-                match first_by_doi.get(&doi) {
-                    Some(&j) => uf_union(&mut parent, i, j),
-                    None => {
-                        first_by_doi.insert(doi, i);
-                    }
-                }
-            }
-        }
-    }
-
-    // Gather connected components, keeping only those with more than one member.
-    let mut by_root: HashMap<usize, Vec<PathBuf>> = HashMap::new();
-    for (i, dir) in dirs.iter().enumerate() {
-        let root = uf_find(&mut parent, i);
-        by_root.entry(root).or_default().push(dir.clone());
-    }
-
-    let mut groups: Vec<Vec<PathBuf>> = by_root
-        .into_values()
-        .filter(|group| group.len() > 1)
-        .collect();
-    // Deterministic ordering for a stable dedup walkthrough.
-    for group in &mut groups {
-        group.sort();
-    }
-    groups.sort();
-
-    Ok(groups)
 }
 
 fn draw_dedup(

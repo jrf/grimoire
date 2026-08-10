@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use serde::Serialize;
 
 use crate::enrich;
 use crate::fetch;
@@ -16,22 +17,50 @@ pub struct Options {
     pub abstracts: bool,
     /// Report what would be attempted without touching the network or disk.
     pub check: bool,
+    /// Suppress human-readable progress on stdout.
+    pub quiet: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum BackfillReport {
+    Check {
+        total: usize,
+        missing_pdf: usize,
+        missing_pdf_with_doi: usize,
+        missing_abstract: usize,
+    },
+    Apply {
+        total: usize,
+        considered: usize,
+        pdfs_added: usize,
+        abstracts_added: usize,
+        unresolved: usize,
+        items: Vec<BackfillItem>,
+    },
+}
+
+#[derive(Debug, Serialize)]
+pub struct BackfillItem {
+    pub key: String,
+    pub status: String,
 }
 
 /// Fill in missing PDFs and abstracts for existing library entries. Purely
 /// additive — an entry that already has the thing is never touched, and
 /// metadata merges only fill empty fields (see [`enrich::enrich_entry`]).
-pub fn run(library: &Path, opts: &Options) -> Result<()> {
+pub fn run(library: &Path, opts: &Options) -> Result<BackfillReport> {
     let dirs = storage::list_ref_dirs(library)?;
 
     if opts.check {
-        return report_check(&dirs);
+        return report_check(&dirs, opts.quiet);
     }
 
     let mut pdfs_added = 0usize;
     let mut abstracts_added = 0usize;
     let mut unresolved = 0usize;
     let mut considered = 0usize;
+    let mut items = Vec::new();
 
     for dir in &dirs {
         let name = dir
@@ -109,7 +138,7 @@ pub fn run(library: &Path, opts: &Options) -> Result<()> {
         if changed {
             metadata::write_info(dir, &reference)
                 .with_context(|| format!("Failed to update {name}"))?;
-            crate::index_reference(library, dir, &reference);
+            crate::index_reference(library, dir, &reference)?;
         }
 
         let status = if notes.is_empty() {
@@ -117,19 +146,31 @@ pub fn run(library: &Path, opts: &Options) -> Result<()> {
         } else {
             notes.join(", ")
         };
-        println!("  {:<44} {}", truncate(&name, 44), status);
+        if !opts.quiet {
+            println!("  {:<44} {}", truncate(&name, 44), status);
+        }
+        items.push(BackfillItem { key: name, status });
     }
 
-    println!(
-        "\nBackfill complete: {pdfs_added} PDF(s) downloaded, {abstracts_added} abstract(s) filled, \
-         {unresolved} unresolved  ({considered} of {} entries had gaps)",
-        dirs.len()
-    );
-    Ok(())
+    if !opts.quiet {
+        println!(
+            "\nBackfill complete: {pdfs_added} PDF(s) downloaded, {abstracts_added} abstract(s) filled, \
+             {unresolved} unresolved  ({considered} of {} entries had gaps)",
+            dirs.len()
+        );
+    }
+    Ok(BackfillReport::Apply {
+        total: dirs.len(),
+        considered,
+        pdfs_added,
+        abstracts_added,
+        unresolved,
+        items,
+    })
 }
 
 /// Local-only preview: count holes without hitting the network.
-fn report_check(dirs: &[std::path::PathBuf]) -> Result<()> {
+fn report_check(dirs: &[std::path::PathBuf], quiet: bool) -> Result<BackfillReport> {
     let mut missing_pdf = 0usize;
     let mut missing_pdf_with_doi = 0usize;
     let mut missing_abstract = 0usize;
@@ -154,11 +195,18 @@ fn report_check(dirs: &[std::path::PathBuf]) -> Result<()> {
         }
     }
 
-    println!("Scanned {} entries:", dirs.len());
-    println!("  missing PDF:                {missing_pdf}");
-    println!("  missing PDF, has DOI:       {missing_pdf_with_doi}  (backfill will try these)");
-    println!("  missing abstract:           {missing_abstract}");
-    Ok(())
+    if !quiet {
+        println!("Scanned {} entries:", dirs.len());
+        println!("  missing PDF:                {missing_pdf}");
+        println!("  missing PDF, has DOI:       {missing_pdf_with_doi}  (backfill will try these)");
+        println!("  missing abstract:           {missing_abstract}");
+    }
+    Ok(BackfillReport::Check {
+        total: dirs.len(),
+        missing_pdf,
+        missing_pdf_with_doi,
+        missing_abstract,
+    })
 }
 
 /// True if the directory contains at least one `.pdf` file on disk. Checks the
