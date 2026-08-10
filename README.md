@@ -57,6 +57,8 @@ grimoire reindex                  # rebuild search index from filesystem
 grimoire semantic-index           # embed new or changed JSONL passages
 grimoire semantic-index --force   # rebuild every passage embedding
 grimoire semantic "retrieval limitations"  # ranked vector-similarity passage search
+grimoire semantic "retrieval limitations" --offset 100 # fetch the next CLI page
+grimoire semantic "retrieval limitations" --all # explicitly return every result
 grimoire validate                 # check library integrity
 grimoire validate --fix           # auto-fix issues (rename temp files, remove junk)
 grimoire completions fish         # emit a shell completion script
@@ -104,6 +106,8 @@ grimoire --json list --query "visual representation" --tag video
 grimoire --json show vaswani-2017-attention
 grimoire --json search "transformer architecture"
 grimoire --json semantic "limitations of self-supervised video models"
+grimoire --json semantic "limitations" --limit 100 --offset 100
+grimoire --json semantic "limitations" --all
 grimoire --json cite vaswani-2017-attention --format typst
 grimoire --json path vaswani-2017-attention
 grimoire --json validate
@@ -240,8 +244,13 @@ Embeddings use a pinned, Q4 ONNX export of Google's on-device EmbeddingGemma
 text is not sent to an embedding API. Run `grimoire semantic "your
 natural-language query"` to print ranked results, or press `v` in the TUI
 to browse all ranked passages with headings and page numbers. Set
-`semantic_results` to a positive number only if you want to cap TUI results;
-the CLI similarly accepts an optional `--limit`. Re-run `semantic-index` after
+`semantic_results` to a positive number only if you want to cap TUI results.
+The TUI hydrates 100 passages initially and automatically loads another page
+near the end of the current results; its status reports loaded and total counts.
+The CLI returns 100 results by default, accepts `--limit` and `--offset` for
+paging, and requires `--all` for an intentionally unbounded response. JSON
+output includes `total`, `offset`, `returned`, and `next_offset`. Re-run
+`semantic-index` after
 regenerating the JSONL files; unchanged
 sources are skipped automatically. Changing the embedding profile triggers a
 complete rebuild even without `--force`. Model

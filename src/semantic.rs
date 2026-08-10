@@ -80,6 +80,78 @@ pub struct SearchHit {
     pub similarity: f32,
 }
 
+pub const DEFAULT_PAGE_SIZE: usize = 100;
+
+#[derive(Debug)]
+struct RankedChunk {
+    id: i64,
+    similarity: f32,
+}
+
+#[derive(Debug)]
+pub struct SearchRanking {
+    chunks: Vec<RankedChunk>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SearchPage {
+    pub hits: Vec<SearchHit>,
+    pub total: usize,
+    pub offset: usize,
+    pub returned: usize,
+    pub next_offset: Option<usize>,
+}
+
+impl SearchRanking {
+    pub fn total(&self) -> usize {
+        self.chunks.len()
+    }
+
+    pub fn page(&self, library: &Path, offset: usize, limit: usize) -> Result<SearchPage> {
+        anyhow::ensure!(limit > 0, "Semantic search limit must be greater than zero");
+        anyhow::ensure!(
+            offset <= self.chunks.len(),
+            "Semantic search offset {offset} exceeds {} results",
+            self.chunks.len()
+        );
+        let end = offset.saturating_add(limit).min(self.chunks.len());
+        let conn = Connection::open(library.join(".grimoire.db"))?;
+        let mut statement = conn.prepare(
+            "SELECT dir_name, paper_title, source_path, chunk_index, text, headings, pages
+             FROM semantic_chunk WHERE id = ?1",
+        )?;
+        let mut hits = Vec::with_capacity(end.saturating_sub(offset));
+        for ranked in &self.chunks[offset..end] {
+            let hit = statement.query_row([ranked.id], |row| {
+                Ok(SearchHit {
+                    dir_name: row.get(0)?,
+                    paper_title: row.get(1)?,
+                    source_path: row.get(2)?,
+                    chunk_index: row.get(3)?,
+                    text: row.get(4)?,
+                    headings: row
+                        .get::<_, String>(5)?
+                        .lines()
+                        .filter(|heading| !heading.is_empty())
+                        .map(str::to_string)
+                        .collect(),
+                    pages: serde_json::from_str(&row.get::<_, String>(6)?).unwrap_or_default(),
+                    similarity: ranked.similarity,
+                })
+            })?;
+            hits.push(hit);
+        }
+        let returned = hits.len();
+        Ok(SearchPage {
+            hits,
+            total: self.chunks.len(),
+            offset,
+            returned,
+            next_offset: (end < self.chunks.len()).then_some(end),
+        })
+    }
+}
+
 pub fn build(
     library: &Path,
     config: &EmbeddingConfig,
@@ -254,38 +326,23 @@ fn embedding_progress_line(
     )
 }
 
-pub fn search(
-    library: &Path,
-    query: &str,
-    limit: Option<usize>,
-    config: &EmbeddingConfig,
-) -> Result<Vec<SearchHit>> {
-    search_inner(library, query, limit, config, true)
+pub fn rank(library: &Path, query: &str, config: &EmbeddingConfig) -> Result<SearchRanking> {
+    rank_inner(library, query, config, true)
 }
 
-pub fn search_silent(
-    library: &Path,
-    query: &str,
-    limit: Option<usize>,
-    config: &EmbeddingConfig,
-) -> Result<Vec<SearchHit>> {
-    search_inner(library, query, limit, config, false)
+pub fn rank_silent(library: &Path, query: &str, config: &EmbeddingConfig) -> Result<SearchRanking> {
+    rank_inner(library, query, config, false)
 }
 
-fn search_inner(
+fn rank_inner(
     library: &Path,
     query: &str,
-    limit: Option<usize>,
     config: &EmbeddingConfig,
     show_download_progress: bool,
-) -> Result<Vec<SearchHit>> {
+) -> Result<SearchRanking> {
     validate_embedding_config(config)?;
     let query = query.trim();
     anyhow::ensure!(!query.is_empty(), "Semantic query cannot be empty");
-    anyhow::ensure!(
-        limit.is_none_or(|limit| limit > 0),
-        "Semantic search limit must be greater than zero"
-    );
 
     let conn = Connection::open(library.join(".grimoire.db"))?;
     let (stored_model_id, dimension, count) = index_metadata(&conn)?;
@@ -313,22 +370,16 @@ fn search_inner(
         query_embedding.len()
     );
 
-    similarity_search(&conn, &query_embedding, limit)
+    similarity_ranking(&conn, &query_embedding)
 }
 
-pub fn search_and_print(
-    library: &Path,
-    query: &str,
-    limit: Option<usize>,
-    config: &EmbeddingConfig,
-) -> Result<()> {
-    let hits = search(library, query, limit, config)?;
-    if hits.is_empty() {
+pub fn print_page(page: &SearchPage) {
+    if page.hits.is_empty() {
         println!("No semantic matches.");
-        return Ok(());
+        return;
     }
 
-    for (position, hit) in hits.iter().enumerate() {
+    for (position, hit) in page.hits.iter().enumerate() {
         let location = match hit.pages.as_slice() {
             [] => String::new(),
             [page] => format!(" · p. {page}"),
@@ -343,7 +394,7 @@ pub fn search_and_print(
         };
         println!(
             "{}. {:.3}  {}{}",
-            position + 1,
+            page.offset + position + 1,
             hit.similarity,
             hit.paper_title,
             location
@@ -354,7 +405,6 @@ pub fn search_and_print(
         println!("   {}", passage_preview(&hit.text, 280));
         println!("   [{} · chunk {}]", hit.source_path, hit.chunk_index);
     }
-    Ok(())
 }
 
 fn validate_embedding_config(config: &EmbeddingConfig) -> Result<()> {
@@ -1095,54 +1145,22 @@ fn semantic_meta(conn: &Connection, key: &str) -> Option<String> {
     .ok()
 }
 
-fn similarity_search(
-    conn: &Connection,
-    query_embedding: &[f32],
-    limit: Option<usize>,
-) -> Result<Vec<SearchHit>> {
-    let mut statement = conn.prepare(
-        "SELECT dir_name, paper_title, source_path, chunk_index, text, headings, pages, embedding
-         FROM semantic_chunk",
-    )?;
+fn similarity_ranking(conn: &Connection, query_embedding: &[f32]) -> Result<SearchRanking> {
+    let mut statement = conn.prepare("SELECT id, embedding FROM semantic_chunk")?;
     let rows = statement.query_map([], |row| {
-        Ok((
-            row.get(0)?,
-            row.get(1)?,
-            row.get(2)?,
-            row.get(3)?,
-            row.get(4)?,
-            row.get::<_, String>(5)?,
-            row.get::<_, String>(6)?,
-            row.get::<_, Vec<u8>>(7)?,
-        ))
+        Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
     })?;
 
     let mut chunks = Vec::new();
     for row in rows {
-        let (dir_name, paper_title, source_path, chunk_index, text, headings, pages, bytes) = row?;
+        let (id, bytes) = row?;
         let embedding = decode_embedding(&bytes)?;
         let similarity = cosine_similarity(query_embedding, &embedding)?;
-        chunks.push(SearchHit {
-            dir_name,
-            paper_title,
-            source_path,
-            chunk_index,
-            text,
-            headings: headings
-                .lines()
-                .filter(|heading| !heading.is_empty())
-                .map(str::to_string)
-                .collect(),
-            pages: serde_json::from_str(&pages).unwrap_or_default(),
-            similarity,
-        });
+        chunks.push(RankedChunk { id, similarity });
     }
 
     chunks.sort_by(|left, right| right.similarity.total_cmp(&left.similarity));
-    if let Some(limit) = limit {
-        chunks.truncate(limit.min(chunks.len()));
-    }
-    Ok(chunks)
+    Ok(SearchRanking { chunks })
 }
 
 fn encode_embedding(embedding: &[f32]) -> Vec<u8> {
@@ -1195,7 +1213,7 @@ mod tests {
         ChunkRecord, DEFAULT_MODEL_ID, IndexPlan, IndexReport, SourceRecord, collect_sources,
         cosine_similarity, decode_embedding, document_input, embedding_progress_line,
         encode_embedding, model_id, normalize_row, open_index, page_values, passage_preview,
-        plan_index, query_input, replace_index, similarity_search, update_index,
+        plan_index, query_input, replace_index, similarity_ranking, update_index,
         validate_embedding_config,
     };
     use crate::config::EmbeddingConfig;
@@ -1349,13 +1367,16 @@ mod tests {
         )
         .unwrap();
 
-        let hits = similarity_search(&conn, &[1.0, 0.0], Some(2)).unwrap();
-        assert_eq!(hits[0].paper_title, "Closest vector");
-        assert!(hits[0].similarity >= hits[1].similarity);
-        assert_eq!(
-            similarity_search(&conn, &[1.0, 0.0], None).unwrap().len(),
-            2
-        );
+        let ranking = similarity_ranking(&conn, &[1.0, 0.0]).unwrap();
+        assert_eq!(ranking.total(), 2);
+        let first = ranking.page(library.path(), 0, 1).unwrap();
+        assert_eq!(first.hits[0].paper_title, "Closest vector");
+        assert_eq!(first.total, 2);
+        assert_eq!(first.returned, 1);
+        assert_eq!(first.next_offset, Some(1));
+        let second = ranking.page(library.path(), 1, 1).unwrap();
+        assert!(first.hits[0].similarity >= second.hits[0].similarity);
+        assert_eq!(second.next_offset, None);
     }
 
     #[test]

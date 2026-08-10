@@ -174,9 +174,15 @@ enum Command {
         /// Natural-language search query
         #[arg(required = true)]
         query: Vec<String>,
-        /// Maximum number of passages to return
-        #[arg(short, long)]
+        /// Number of passages to return (defaults to 100)
+        #[arg(short, long, conflicts_with = "all")]
         limit: Option<usize>,
+        /// Zero-based result offset
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        /// Return every result from the offset onward
+        #[arg(long)]
+        all: bool,
     },
     /// Validate library integrity (missing PDFs, junk files, temp names)
     Validate {
@@ -524,17 +530,30 @@ fn run(cli: Cli) -> Result<()> {
                 Ok(())
             }
         }
-        Some(Command::Semantic { query, limit }) => {
+        Some(Command::Semantic {
+            query,
+            limit,
+            offset,
+            all,
+        }) => {
             let query = query.join(" ");
-            if cli.json {
-                cli::print_json(semantic::search(
-                    &library,
-                    &query,
-                    limit,
-                    &config.embedding,
-                )?)
+            let ranking = semantic::rank(&library, &query, &config.embedding)?;
+            anyhow::ensure!(
+                offset <= ranking.total(),
+                "Semantic search offset {offset} exceeds {} results",
+                ranking.total()
+            );
+            let page_limit = if all {
+                ranking.total().saturating_sub(offset).max(1)
             } else {
-                semantic::search_and_print(&library, &query, limit, &config.embedding)
+                limit.unwrap_or(semantic::DEFAULT_PAGE_SIZE)
+            };
+            let page = ranking.page(&library, offset, page_limit)?;
+            if cli.json {
+                cli::print_json(page)
+            } else {
+                semantic::print_page(&page);
+                Ok(())
             }
         }
         Some(Command::Validate { fix }) => {
@@ -918,4 +937,52 @@ fn add_from_url(library: &Path, url: &str, force: bool) -> Result<()> {
     std::fs::write(&tmp_path, bytes)?;
 
     add_from_file(library, tmp_path.to_str().unwrap(), force)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Command};
+    use clap::Parser;
+
+    #[test]
+    fn semantic_cli_defaults_to_first_page_and_supports_explicit_paging() {
+        let cli = Cli::try_parse_from(["grimoire", "semantic", "synthetic query"]).unwrap();
+        let Some(Command::Semantic {
+            limit, offset, all, ..
+        }) = cli.command
+        else {
+            panic!("semantic command was not parsed");
+        };
+        assert_eq!(limit, None);
+        assert_eq!(offset, 0);
+        assert!(!all);
+
+        let cli = Cli::try_parse_from([
+            "grimoire",
+            "semantic",
+            "synthetic query",
+            "--limit",
+            "25",
+            "--offset",
+            "100",
+        ])
+        .unwrap();
+        let Some(Command::Semantic { limit, offset, .. }) = cli.command else {
+            panic!("semantic command was not parsed");
+        };
+        assert_eq!(limit, Some(25));
+        assert_eq!(offset, 100);
+
+        assert!(
+            Cli::try_parse_from([
+                "grimoire",
+                "semantic",
+                "synthetic query",
+                "--limit",
+                "25",
+                "--all",
+            ])
+            .is_err()
+        );
+    }
 }
