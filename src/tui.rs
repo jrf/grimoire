@@ -2610,6 +2610,7 @@ fn draw_semantic_preview(f: &mut Frame, hit: &SearchHit, area: Rect, scroll: u16
             hit.paper_title.as_str(),
             s.text.add_modifier(Modifier::BOLD),
         )),
+        Line::from(""),
     ];
     let pages = match hit.pages.as_slice() {
         [] => String::new(),
@@ -2634,14 +2635,21 @@ fn draw_semantic_preview(f: &mut Frame, hit: &SearchHit, area: Rect, scroll: u16
             s.highlight,
         ),
     ]));
+    lines.push(Line::from(""));
     if !hit.headings.is_empty() {
         lines.push(Line::from(Span::styled(
             semantic_heading_text(&hit.headings),
             s.author,
         )));
     }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(hit.text.as_str(), s.dim)));
+    if !hit.headings.is_empty() {
+        lines.push(Line::from(""));
+    }
+    lines.extend(
+        semantic_passage_lines(&hit.text, &hit.headings)
+            .into_iter()
+            .map(|line| Line::from(Span::styled(line, s.dim))),
+    );
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         format!("{} · chunk {}", hit.source_path, hit.chunk_index),
@@ -2658,6 +2666,22 @@ fn draw_semantic_preview(f: &mut Frame, hit: &SearchHit, area: Rect, scroll: u16
 
 fn semantic_heading_text(headings: &[String]) -> String {
     format!("{}  ", headings.join(" › "))
+}
+
+fn semantic_passage_lines<'a>(text: &'a str, headings: &[String]) -> Vec<&'a str> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut start = 0;
+    while lines.get(start).is_some_and(|line| {
+        headings
+            .iter()
+            .any(|heading| line.trim().eq_ignore_ascii_case(heading.trim()))
+    }) {
+        start += 1;
+    }
+    while lines.get(start).is_some_and(|line| line.trim().is_empty()) {
+        start += 1;
+    }
+    lines[start..].to_vec()
 }
 
 fn draw_preview(f: &mut Frame, app: &App, area: ratatui::layout::Rect, s: &Styles) {
@@ -3187,7 +3211,7 @@ mod tests {
 
     use super::{
         LayoutMode, picker_rect, prepare_reader_command, semantic_error_message,
-        semantic_heading_text,
+        semantic_heading_text, semantic_passage_lines,
     };
     use ratatui::layout::Rect;
 
@@ -3272,6 +3296,22 @@ mod tests {
         assert_eq!(
             semantic_heading_text(&["1 INTRODUCTION".to_string(), "Background".to_string()]),
             "1 INTRODUCTION › Background  "
+        );
+    }
+
+    #[test]
+    fn semantic_passage_uses_real_lines_without_repeating_heading() {
+        let headings = vec!["1 Introduction".to_string()];
+        assert_eq!(
+            semantic_passage_lines(
+                "1 Introduction\nAdditionally, DINOv3 improves features.\n\nSecond paragraph.",
+                &headings,
+            ),
+            [
+                "Additionally, DINOv3 improves features.",
+                "",
+                "Second paragraph."
+            ]
         );
     }
 }
