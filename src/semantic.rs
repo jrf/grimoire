@@ -1,4 +1,4 @@
-use std::fs::File;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -9,6 +9,7 @@ use fastembed::{
 };
 use rusqlite::{Connection, params};
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 
 use crate::config::{EmbeddingConfig, EmbeddingOutput};
 use crate::{metadata, storage};
@@ -16,7 +17,7 @@ use crate::{metadata, storage};
 const DEFAULT_MODEL_ID: &str =
     "onnx-community/embeddinggemma-300m-ONNX@5090578d9565bb06545b4552f76e6bc2c93e4a66#q4";
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ChunkRecord {
     dir_name: String,
     paper_title: String,
@@ -26,6 +27,22 @@ struct ChunkRecord {
     headings: Vec<String>,
     pages: Vec<u32>,
     metadata_json: String,
+}
+
+#[derive(Debug, Clone)]
+struct SourceRecord {
+    source_path: String,
+    fingerprint: String,
+    chunks: Vec<ChunkRecord>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum IndexPlan {
+    Rebuild,
+    Incremental {
+        changed: HashSet<String>,
+        deleted: Vec<String>,
+    },
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -48,11 +65,11 @@ pub struct SearchHit {
     pub similarity: f32,
 }
 
-pub fn build(library: &Path, config: &EmbeddingConfig) -> Result<()> {
+pub fn build(library: &Path, config: &EmbeddingConfig, force: bool) -> Result<()> {
     validate_embedding_config(config)?;
     let model_id = model_id(config)?;
-    let (chunks, report) = collect_chunks(library)?;
-    if chunks.is_empty() {
+    let (sources, report) = collect_sources(library)?;
+    if report.chunks == 0 {
         anyhow::bail!(
             "No indexable JSONL rows found below paper derived/ directories ({} files, {} skipped, {} malformed)",
             report.files,
@@ -61,37 +78,80 @@ pub fn build(library: &Path, config: &EmbeddingConfig) -> Result<()> {
         );
     }
 
-    println!(
-        "Embedding {} passages from {} JSONL files with {}...",
-        chunks.len(),
-        report.files,
-        config.repo
-    );
-    let mut model = embedding_model(config, true)?;
-    let texts: Vec<String> = chunks
-        .iter()
-        .map(|chunk| document_input(config, &chunk.paper_title, &chunk.text))
-        .collect();
-    let embeddings = embed_passages(&mut model, &texts, config.batch_size, true)?;
-    anyhow::ensure!(
-        embeddings.len() == chunks.len(),
-        "Embedding model returned {} vectors for {} passages",
-        embeddings.len(),
-        chunks.len()
-    );
-    let dimension = embeddings.first().map(Vec::len).unwrap_or_default();
-    anyhow::ensure!(dimension > 0, "Embedding model returned empty vectors");
-    anyhow::ensure!(
-        embeddings
-            .iter()
-            .all(|embedding| embedding.len() == dimension),
-        "Embedding model returned inconsistent vector dimensions"
-    );
+    let conn = open_index(library)?;
+    let plan = plan_index(&conn, &sources, &model_id, force)?;
+    let (changed_sources, deleted, rebuilding) = match plan {
+        IndexPlan::Rebuild => (sources.iter().collect::<Vec<_>>(), Vec::new(), true),
+        IndexPlan::Incremental { changed, deleted } => (
+            sources
+                .iter()
+                .filter(|source| changed.contains(&source.source_path))
+                .collect(),
+            deleted,
+            false,
+        ),
+    };
+    if changed_sources.is_empty() && deleted.is_empty() {
+        println!(
+            "Semantic index is up to date ({} passages from {} files).",
+            report.chunks, report.files
+        );
+        return Ok(());
+    }
 
-    replace_index(library, &chunks, &embeddings, dimension, &model_id)?;
+    let chunks: Vec<&ChunkRecord> = changed_sources
+        .iter()
+        .flat_map(|source| source.chunks.iter())
+        .collect();
+
+    let (embeddings, dimension) = if chunks.is_empty() {
+        let (_, dimension, _) = index_metadata(&conn)?;
+        (Vec::new(), dimension)
+    } else {
+        println!(
+            "Embedding {} new or changed passages from {} JSONL files with {}...",
+            chunks.len(),
+            changed_sources.len(),
+            config.repo
+        );
+        let mut model = embedding_model(config, true)?;
+        let texts: Vec<String> = chunks
+            .iter()
+            .map(|chunk| document_input(config, &chunk.paper_title, &chunk.text))
+            .collect();
+        let embeddings = embed_passages(&mut model, &texts, config.batch_size, true)?;
+        anyhow::ensure!(
+            embeddings.len() == chunks.len(),
+            "Embedding model returned {} vectors for {} passages",
+            embeddings.len(),
+            chunks.len()
+        );
+        let dimension = embeddings.first().map(Vec::len).unwrap_or_default();
+        anyhow::ensure!(dimension > 0, "Embedding model returned empty vectors");
+        anyhow::ensure!(
+            embeddings
+                .iter()
+                .all(|embedding| embedding.len() == dimension),
+            "Embedding model returned inconsistent vector dimensions"
+        );
+        (embeddings, dimension)
+    };
+
+    if rebuilding {
+        replace_index(&conn, &sources, &embeddings, dimension, &model_id)?;
+    } else {
+        update_index(&conn, &changed_sources, &deleted, &embeddings)?;
+    }
+    let reused = report.files.saturating_sub(changed_sources.len());
     println!(
-        "Indexed {} passages from {} files ({} skipped, {} malformed; {} dimensions).",
-        report.chunks, report.files, report.skipped, report.malformed, dimension
+        "Indexed {} passages from {} files ({} unchanged, {} removed, {} skipped, {} malformed; {} dimensions).",
+        report.chunks,
+        report.files,
+        reused,
+        deleted.len(),
+        report.skipped,
+        report.malformed,
+        dimension
     );
     Ok(())
 }
@@ -492,8 +552,8 @@ fn read_model_file(cache_dir: &Path, relative_path: &str) -> Result<Vec<u8>> {
     std::fs::read(&path).with_context(|| format!("Failed to read {}", path.display()))
 }
 
-fn collect_chunks(library: &Path) -> Result<(Vec<ChunkRecord>, IndexReport)> {
-    let mut chunks = Vec::new();
+fn collect_sources(library: &Path) -> Result<(Vec<SourceRecord>, IndexReport)> {
+    let mut sources = Vec::new();
     let mut report = IndexReport::default();
 
     for ref_dir in storage::list_ref_dirs(library)? {
@@ -520,9 +580,15 @@ fn collect_chunks(library: &Path) -> Result<(Vec<ChunkRecord>, IndexReport)> {
                 .unwrap_or(&path)
                 .to_string_lossy()
                 .to_string();
-            let reader = BufReader::new(
-                File::open(&path).with_context(|| format!("Failed to read {}", path.display()))?,
-            );
+            let bytes = std::fs::read(&path)
+                .with_context(|| format!("Failed to read {}", path.display()))?;
+            let mut fingerprint = Sha256::new();
+            fingerprint.update(paper_title.as_bytes());
+            fingerprint.update([0]);
+            fingerprint.update(&bytes);
+            let fingerprint = format!("{:x}", fingerprint.finalize());
+            let reader = BufReader::new(bytes.as_slice());
+            let mut chunks = Vec::new();
             for (line_index, line) in reader.lines().enumerate() {
                 let line = line?;
                 if line.trim().is_empty() {
@@ -543,10 +609,15 @@ fn collect_chunks(library: &Path) -> Result<(Vec<ChunkRecord>, IndexReport)> {
                     None => report.skipped += 1,
                 }
             }
+            sources.push(SourceRecord {
+                source_path,
+                fingerprint,
+                chunks,
+            });
         }
     }
 
-    Ok((chunks, report))
+    Ok((sources, report))
 }
 
 fn find_jsonl_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
@@ -669,20 +740,152 @@ fn page_values(value: &Value) -> Vec<u32> {
     pages
 }
 
+fn open_index(library: &Path) -> Result<Connection> {
+    let conn = Connection::open(library.join(".grimoire.db"))?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
+    Ok(conn)
+}
+
+fn plan_index(
+    conn: &Connection,
+    sources: &[SourceRecord],
+    model_id: &str,
+    force: bool,
+) -> Result<IndexPlan> {
+    if force || semantic_meta(conn, "model_id").as_deref() != Some(model_id) {
+        return Ok(IndexPlan::Rebuild);
+    }
+    let has_source_table: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'semantic_source')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_source_table {
+        return migrate_legacy_index(conn, sources);
+    }
+
+    let mut statement = conn.prepare("SELECT source_path, fingerprint FROM semantic_source")?;
+    let stored = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<std::result::Result<HashMap<_, _>, _>>()?;
+    let current: HashMap<&str, &str> = sources
+        .iter()
+        .map(|source| (source.source_path.as_str(), source.fingerprint.as_str()))
+        .collect();
+    let changed = current
+        .iter()
+        .filter(|(path, fingerprint)| stored.get(**path).map(String::as_str) != Some(**fingerprint))
+        .map(|(path, _)| (*path).to_string())
+        .collect();
+    let deleted = stored
+        .keys()
+        .filter(|path| !current.contains_key(path.as_str()))
+        .cloned()
+        .collect();
+    Ok(IndexPlan::Incremental { changed, deleted })
+}
+
+fn migrate_legacy_index(conn: &Connection, sources: &[SourceRecord]) -> Result<IndexPlan> {
+    let has_chunk_table: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'semantic_chunk')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_chunk_table {
+        return Ok(IndexPlan::Rebuild);
+    }
+
+    let stored_paths: HashSet<String> = conn
+        .prepare("SELECT DISTINCT source_path FROM semantic_chunk")?
+        .query_map([], |row| row.get(0))?
+        .collect::<std::result::Result<_, _>>()?;
+    let current_paths: HashSet<&str> = sources
+        .iter()
+        .map(|source| source.source_path.as_str())
+        .collect();
+    let deleted = stored_paths
+        .iter()
+        .filter(|path| !current_paths.contains(path.as_str()))
+        .cloned()
+        .collect();
+    let mut changed = HashSet::new();
+    let mut unchanged = Vec::new();
+    for source in sources {
+        if stored_source_matches(conn, source)? {
+            unchanged.push(source);
+        } else {
+            changed.insert(source.source_path.clone());
+        }
+    }
+
+    conn.execute_batch(
+        "CREATE TABLE semantic_source (
+             source_path TEXT PRIMARY KEY,
+             fingerprint TEXT NOT NULL
+         );",
+    )?;
+    let mut statement =
+        conn.prepare("INSERT INTO semantic_source (source_path, fingerprint) VALUES (?1, ?2)")?;
+    for source in unchanged {
+        statement.execute(params![source.source_path, source.fingerprint])?;
+    }
+    Ok(IndexPlan::Incremental { changed, deleted })
+}
+
+fn stored_source_matches(conn: &Connection, source: &SourceRecord) -> Result<bool> {
+    let mut statement = conn.prepare(
+        "SELECT dir_name, paper_title, source_path, chunk_index, text, headings, pages, metadata_json
+         FROM semantic_chunk WHERE source_path = ?1 ORDER BY id",
+    )?;
+    let rows = statement.query_map([&source.source_path], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, String>(6)?,
+            row.get::<_, String>(7)?,
+        ))
+    })?;
+    let mut stored = Vec::new();
+    for row in rows {
+        let (dir_name, paper_title, source_path, chunk_index, text, headings, pages, metadata_json) =
+            row?;
+        stored.push(ChunkRecord {
+            dir_name,
+            paper_title,
+            source_path,
+            chunk_index,
+            text,
+            headings: headings.lines().map(str::to_string).collect(),
+            pages: serde_json::from_str(&pages).unwrap_or_default(),
+            metadata_json,
+        });
+    }
+    Ok(stored == source.chunks)
+}
+
 fn replace_index(
-    library: &Path,
-    chunks: &[ChunkRecord],
+    conn: &Connection,
+    sources: &[SourceRecord],
     embeddings: &[Vec<f32>],
     dimension: usize,
     model_id: &str,
 ) -> Result<()> {
-    let conn = Connection::open(library.join(".grimoire.db"))?;
-    conn.busy_timeout(std::time::Duration::from_secs(5))?;
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
     let tx = conn.unchecked_transaction()?;
     tx.execute_batch(
         "DROP TABLE IF EXISTS semantic_chunk_fts;
          DROP TABLE IF EXISTS semantic_chunk;
+         DROP TABLE IF EXISTS semantic_source;
+         CREATE TABLE semantic_source (
+             source_path TEXT PRIMARY KEY,
+             fingerprint TEXT NOT NULL
+         );
          CREATE TABLE semantic_chunk (
              id INTEGER PRIMARY KEY,
              dir_name TEXT NOT NULL,
@@ -708,24 +911,25 @@ fn replace_index(
     )?;
 
     {
+        let mut source_statement =
+            tx.prepare("INSERT INTO semantic_source (source_path, fingerprint) VALUES (?1, ?2)")?;
         let mut statement = tx.prepare(
             "INSERT INTO semantic_chunk
              (dir_name, paper_title, source_path, chunk_index, text, headings, pages, metadata_json, embedding)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         )?;
-        for (chunk, embedding) in chunks.iter().zip(embeddings) {
-            statement.execute(params![
-                chunk.dir_name,
-                chunk.paper_title,
-                chunk.source_path,
-                chunk.chunk_index,
-                chunk.text,
-                chunk.headings.join("\n"),
-                serde_json::to_string(&chunk.pages)?,
-                chunk.metadata_json,
-                encode_embedding(embedding),
-            ])?;
+        let mut embeddings = embeddings.iter();
+        for source in sources {
+            source_statement.execute(params![source.source_path, source.fingerprint])?;
+            for chunk in &source.chunks {
+                let embedding = embeddings.next().context("Missing passage embedding")?;
+                insert_chunk(&mut statement, chunk, embedding)?;
+            }
         }
+        anyhow::ensure!(
+            embeddings.next().is_none(),
+            "Received extra passage embeddings"
+        );
     }
 
     tx.execute(
@@ -741,6 +945,79 @@ fn replace_index(
         [dimension.to_string()],
     )?;
     tx.commit()?;
+    Ok(())
+}
+
+fn update_index(
+    conn: &Connection,
+    changed_sources: &[&SourceRecord],
+    deleted: &[String],
+    embeddings: &[Vec<f32>],
+) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute("DROP TABLE IF EXISTS semantic_chunk_fts", [])?;
+    let mut delete_chunks = tx.prepare("DELETE FROM semantic_chunk WHERE source_path = ?1")?;
+    let mut delete_source = tx.prepare("DELETE FROM semantic_source WHERE source_path = ?1")?;
+    for source_path in deleted {
+        delete_chunks.execute([source_path])?;
+        delete_source.execute([source_path])?;
+    }
+
+    let mut source_statement = tx.prepare(
+        "INSERT INTO semantic_source (source_path, fingerprint) VALUES (?1, ?2)
+         ON CONFLICT(source_path) DO UPDATE SET fingerprint = excluded.fingerprint",
+    )?;
+    let mut chunk_statement = tx.prepare(
+        "INSERT INTO semantic_chunk
+         (dir_name, paper_title, source_path, chunk_index, text, headings, pages, metadata_json, embedding)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+    )?;
+    let mut embeddings = embeddings.iter();
+    for source in changed_sources {
+        delete_chunks.execute([&source.source_path])?;
+        source_statement.execute(params![source.source_path, source.fingerprint])?;
+        for chunk in &source.chunks {
+            let embedding = embeddings.next().context("Missing passage embedding")?;
+            insert_chunk(&mut chunk_statement, chunk, embedding)?;
+        }
+    }
+    anyhow::ensure!(
+        embeddings.next().is_none(),
+        "Received extra passage embeddings"
+    );
+    drop(chunk_statement);
+    drop(source_statement);
+    drop(delete_source);
+    drop(delete_chunks);
+
+    tx.execute_batch(
+        "CREATE VIRTUAL TABLE semantic_chunk_fts USING fts5(
+             text, headings,
+             content='semantic_chunk',
+             content_rowid='id'
+         );
+         INSERT INTO semantic_chunk_fts(semantic_chunk_fts) VALUES('rebuild');",
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn insert_chunk(
+    statement: &mut rusqlite::Statement<'_>,
+    chunk: &ChunkRecord,
+    embedding: &[f32],
+) -> Result<()> {
+    statement.execute(params![
+        chunk.dir_name,
+        chunk.paper_title,
+        chunk.source_path,
+        chunk.chunk_index,
+        chunk.text,
+        chunk.headings.join("\n"),
+        serde_json::to_string(&chunk.pages)?,
+        chunk.metadata_json,
+        encode_embedding(embedding),
+    ])?;
     Ok(())
 }
 
@@ -861,13 +1138,13 @@ fn passage_preview(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChunkRecord, DEFAULT_MODEL_ID, IndexReport, collect_chunks, cosine_similarity,
-        decode_embedding, document_input, embedding_progress_line, encode_embedding, model_id,
-        normalize_row, page_values, passage_preview, query_input, replace_index, similarity_search,
+        ChunkRecord, DEFAULT_MODEL_ID, IndexPlan, IndexReport, SourceRecord, collect_sources,
+        cosine_similarity, decode_embedding, document_input, embedding_progress_line,
+        encode_embedding, model_id, normalize_row, open_index, page_values, passage_preview,
+        plan_index, query_input, replace_index, similarity_search, update_index,
         validate_embedding_config,
     };
     use crate::config::EmbeddingConfig;
-    use rusqlite::Connection;
     use serde_json::json;
 
     #[test]
@@ -983,7 +1260,7 @@ mod tests {
         )
         .unwrap();
 
-        let (chunks, report) = collect_chunks(library.path()).unwrap();
+        let (sources, report) = collect_sources(library.path()).unwrap();
         assert_eq!(
             report,
             IndexReport {
@@ -993,30 +1270,174 @@ mod tests {
                 malformed: 1,
             }
         );
-        assert_eq!(chunks[0].paper_title, "Synthetic Paper");
-        assert_eq!(chunks[1].pages, [4]);
+        assert_eq!(sources[0].chunks[0].paper_title, "Synthetic Paper");
+        assert_eq!(sources[1].chunks[0].pages, [4]);
     }
 
     #[test]
     fn search_orders_results_by_descending_similarity() {
         let library = tempfile::tempdir().unwrap();
-        let chunks = vec![
-            synthetic_chunk("Closest vector", "A related synthetic passage", 0),
-            synthetic_chunk("Exact term", "A synthetic passage with needle", 1),
-        ];
+        let source = SourceRecord {
+            source_path: "synthetic-paper/derived/chunks.jsonl".to_string(),
+            fingerprint: "first".to_string(),
+            chunks: vec![
+                synthetic_chunk("Closest vector", "A related synthetic passage", 0),
+                synthetic_chunk("Exact term", "A synthetic passage with needle", 1),
+            ],
+        };
+        let conn = open_index(library.path()).unwrap();
         replace_index(
-            library.path(),
-            &chunks,
+            &conn,
+            &[source],
             &[vec![1.0, 0.0], vec![0.9, 0.1]],
             2,
             "synthetic-model",
         )
         .unwrap();
-        let conn = Connection::open(library.path().join(".grimoire.db")).unwrap();
 
         let hits = similarity_search(&conn, &[1.0, 0.0], 2).unwrap();
         assert_eq!(hits[0].paper_title, "Closest vector");
         assert!(hits[0].similarity >= hits[1].similarity);
+    }
+
+    #[test]
+    fn incremental_plan_detects_changed_new_and_deleted_sources() {
+        let library = tempfile::tempdir().unwrap();
+        let conn = open_index(library.path()).unwrap();
+        let original = synthetic_source("first.jsonl", "first");
+        let deleted = synthetic_source("deleted.jsonl", "deleted");
+        replace_index(
+            &conn,
+            &[original.clone(), deleted],
+            &[vec![1.0, 0.0], vec![0.0, 1.0]],
+            2,
+            "synthetic-model",
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan_index(
+                &conn,
+                std::slice::from_ref(&original),
+                "synthetic-model",
+                false
+            )
+            .unwrap(),
+            IndexPlan::Incremental {
+                changed: Default::default(),
+                deleted: vec!["deleted.jsonl".to_string()],
+            }
+        );
+
+        let changed = synthetic_source("first.jsonl", "second");
+        let new = synthetic_source("new.jsonl", "new");
+        let plan = plan_index(&conn, &[changed, new], "synthetic-model", false).unwrap();
+        let IndexPlan::Incremental { changed, deleted } = plan else {
+            panic!("expected incremental plan");
+        };
+        assert_eq!(
+            changed,
+            ["first.jsonl".to_string(), "new.jsonl".to_string()]
+                .into_iter()
+                .collect()
+        );
+        assert_eq!(deleted, ["deleted.jsonl"]);
+        assert_eq!(
+            plan_index(&conn, &[original], "other-model", false).unwrap(),
+            IndexPlan::Rebuild
+        );
+        assert_eq!(
+            plan_index(&conn, &[], "synthetic-model", true).unwrap(),
+            IndexPlan::Rebuild
+        );
+    }
+
+    #[test]
+    fn incremental_update_reuses_unchanged_embeddings_and_removes_deleted_sources() {
+        let library = tempfile::tempdir().unwrap();
+        let conn = open_index(library.path()).unwrap();
+        let changed = synthetic_source("changed.jsonl", "first");
+        let unchanged = synthetic_source("unchanged.jsonl", "unchanged");
+        let deleted = synthetic_source("deleted.jsonl", "deleted");
+        replace_index(
+            &conn,
+            &[changed.clone(), unchanged, deleted],
+            &[vec![1.0, 0.0], vec![0.0, 1.0], vec![-1.0, 0.0]],
+            2,
+            "synthetic-model",
+        )
+        .unwrap();
+
+        let mut replacement = changed;
+        replacement.fingerprint = "second".to_string();
+        update_index(
+            &conn,
+            &[&replacement],
+            &["deleted.jsonl".to_string()],
+            &[vec![0.5, 0.5]],
+        )
+        .unwrap();
+
+        let rows: Vec<(String, Vec<u8>)> = conn
+            .prepare("SELECT source_path, embedding FROM semantic_chunk ORDER BY source_path")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, "changed.jsonl");
+        assert_eq!(decode_embedding(&rows[0].1).unwrap(), [0.5, 0.5]);
+        assert_eq!(rows[1].0, "unchanged.jsonl");
+        assert_eq!(decode_embedding(&rows[1].1).unwrap(), [0.0, 1.0]);
+    }
+
+    #[test]
+    fn legacy_index_gains_fingerprints_without_reembedding_matching_passages() {
+        let library = tempfile::tempdir().unwrap();
+        let conn = open_index(library.path()).unwrap();
+        let source = synthetic_source("existing.jsonl", "fingerprint");
+        replace_index(
+            &conn,
+            std::slice::from_ref(&source),
+            &[vec![1.0, 0.0]],
+            2,
+            "synthetic-model",
+        )
+        .unwrap();
+        conn.execute("DROP TABLE semantic_source", []).unwrap();
+
+        assert_eq!(
+            plan_index(
+                &conn,
+                std::slice::from_ref(&source),
+                "synthetic-model",
+                false
+            )
+            .unwrap(),
+            IndexPlan::Incremental {
+                changed: Default::default(),
+                deleted: Vec::new(),
+            }
+        );
+        let fingerprint: String = conn
+            .query_row(
+                "SELECT fingerprint FROM semantic_source WHERE source_path = ?1",
+                [&source.source_path],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(fingerprint, "fingerprint");
+    }
+
+    fn synthetic_source(source_path: &str, fingerprint: &str) -> SourceRecord {
+        let mut chunk = synthetic_chunk("Synthetic Paper", "Synthetic passage", 0);
+        chunk.source_path = source_path.to_string();
+        SourceRecord {
+            source_path: source_path.to_string(),
+            fingerprint: fingerprint.to_string(),
+            chunks: vec![chunk],
+        }
     }
 
     fn synthetic_chunk(paper_title: &str, text: &str, chunk_index: i64) -> ChunkRecord {

@@ -44,7 +44,8 @@ grimoire backfill                 # fetch missing PDFs + abstracts for existing 
 grimoire backfill --check         # report how many entries are missing a PDF / abstract
 grimoire backfill --pdfs-only     # only download missing PDFs (open-access)
 grimoire reindex                  # rebuild search index from filesystem
-grimoire semantic-index           # embed JSONL passages under derived/ directories
+grimoire semantic-index           # embed new or changed JSONL passages
+grimoire semantic-index --force   # rebuild every passage embedding
 grimoire semantic "retrieval limitations"  # ranked vector-similarity passage search
 grimoire validate                 # check library integrity
 grimoire validate --fix           # auto-fix issues (rename temp files, remove junk)
@@ -181,7 +182,10 @@ deduplicator (`d` in the TUI) groups existing references that share a title
 ## Semantic search
 
 `grimoire semantic-index` recursively reads `*.jsonl` files below each paper's
-`derived/` directory and builds a local passage index in `.grimoire.db`. Rows
+`derived/` directory and builds a local passage index in `.grimoire.db`. It
+fingerprints each source by content and paper title, embeds only new or changed
+sources, removes entries for deleted sources, and reuses unchanged embeddings.
+Use `semantic-index --force` to rebuild every embedding. Rows
 may come from Docling or another exporter. Grimoire looks for passage content in
 `text`, `content`, `page_content`, or `raw_text`; headings, page numbers, and
 chunk identifiers are optional, and the original JSON object is preserved as
@@ -192,7 +196,9 @@ Embeddings use a pinned, Q4 ONNX export of Google's on-device EmbeddingGemma
 text is not sent to an embedding API. Run `grimoire semantic "your
 natural-language query"` to print ranked results, or press `ctrl-s` in the TUI
 to browse the configured top `semantic_results` passages with headings and page
-numbers. Re-run `semantic-index` after regenerating the JSONL files. Model
+numbers. Re-run `semantic-index` after regenerating the JSONL files; unchanged
+sources are skipped automatically. Changing the embedding profile triggers a
+complete rebuild even without `--force`. Model
 downloads honor `HF_ENDPOINT` and the standard `SSL_CERT_FILE`,
 `REQUESTS_CA_BUNDLE`, or `CURL_CA_BUNDLE` PEM bundle.
 

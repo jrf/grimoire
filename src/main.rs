@@ -74,7 +74,11 @@ enum Command {
     /// Rebuild the search index from filesystem
     Reindex,
     /// Build a local vector index from JSONL files under each paper's derived directory
-    SemanticIndex,
+    SemanticIndex {
+        /// Re-embed every passage even when its source is unchanged
+        #[arg(long)]
+        force: bool,
+    },
     /// Search indexed passages by semantic similarity
     Semantic {
         /// Natural-language search query
@@ -131,7 +135,9 @@ fn main() -> Result<()> {
             },
         ),
         Some(Command::Reindex) => cmd_reindex(&library),
-        Some(Command::SemanticIndex) => semantic::build(&library, &config.embedding),
+        Some(Command::SemanticIndex { force }) => {
+            semantic::build(&library, &config.embedding, force)
+        }
         Some(Command::Semantic { query, limit }) => {
             semantic::search_and_print(&library, &query.join(" "), limit, &config.embedding)
         }
