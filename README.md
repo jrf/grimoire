@@ -1,12 +1,13 @@
 # Grimoire
 
-A fast TUI reference manager.
+A fast, local-first scholarly library for papers and books.
 
-![Grimoire paper browser](assets/grimoire-paper-browser.png)
+![Grimoire library browser](assets/grimoire-paper-browser.png)
 
 ## Install
 
-Requires Rust.
+Requires Rust. Source-PDF formula previews are optional and require Kitty plus
+`pdftoppm` from Poppler (`brew install poppler` on macOS).
 
 ```
 cargo install --path .
@@ -34,6 +35,8 @@ grimoire jepa                     # browse with "jepa" pre-filled
 grimoire add 1706.03762           # import by arXiv ID (fetches metadata + PDF)
 grimoire add 10.1038/nature14539  # import by DOI (fetches metadata)
 grimoire add paper.pdf            # import local PDF
+grimoire add --kind book --title "Understanding Analysis" --author "Stephen Abbott" book.pdf
+grimoire import-derived abbott-2015-understanding --docling document.json
 grimoire add 1706.03762 2201.1234 # batch import (each input handled independently)
 grimoire add --force 1706.03762   # import even if a matching DOI/title already exists
 grimoire cite --format typst      # pick a reference, output @cite-key
@@ -56,8 +59,9 @@ grimoire backfill --pdfs-only     # only download missing PDFs (open-access)
 grimoire reindex                  # rebuild search index from filesystem
 grimoire semantic-index           # embed new or changed JSONL passages
 grimoire semantic-index --force   # rebuild every passage embedding
-grimoire semantic "retrieval limitations"  # papers ranked by their best passage
-grimoire semantic "retrieval limitations" --per-paper 3 # include top 3 passages per paper
+grimoire semantic "retrieval limitations"  # works ranked by their best passage
+grimoire semantic "monotone convergence" --exact # exact-term filter + similarity rank
+grimoire semantic "retrieval limitations" --per-paper 3 # include top 3 passages per work
 grimoire semantic "retrieval limitations" --group passages # raw passage ranking
 grimoire semantic "retrieval limitations" --offset 100 # fetch the next CLI page
 grimoire semantic "retrieval limitations" --all # explicitly return every result
@@ -73,12 +77,12 @@ grimoire completions fish         # emit a shell completion script
 | `j / k` | Move down / up |
 | `g / G` | Jump to top / bottom |
 | `/ or i` | Enter search mode |
-| `v` | Search indexed papers semantically |
+| `v` | Search indexed works semantically |
 | `enter` | Open PDF (browse), confirm search (search) |
 | `e` | Edit info.toml |
 | `y` | Copy BibTeX |
 | `o` | Open DOI / arXiv in browser |
-| `a` | Add paper (path, DOI, arXiv ID, URL) |
+| `a` | Add work (path, DOI, arXiv ID, URL) |
 | `r` | Enrich selected (fetch metadata) |
 | `R` | Enrich all with missing fields |
 | `s` | Cycle sort (name/author/year/title) |
@@ -92,12 +96,12 @@ grimoire completions fish         # emit a shell completion script
 | `?` | Help |
 | `q` | Quit |
 
-Semantic results start as one row per paper, ordered by that paper's strongest
-matching passage. Lowercase `p` toggles between the selected paper and its
+Semantic results start as one row per work, ordered by that work's strongest
+matching passage. Lowercase `p` toggles between the selected work and its
 ranked passages; `l` or Right also opens them. Uppercase `P` toggles between
-grouped papers and the global raw-passage ranking. From either passage view,
-`h` or Left returns to the grouped paper results; `esc` also returns from a
-selected paper's passages. In every view, `j / k` moves, `space` expands the
+grouped works and the global raw-passage ranking. From either passage view,
+`h` or Left returns to the grouped work results; `esc` also returns from a
+selected work's passages. In every view, `j / k` moves, `space` expands the
 selected match, `enter` opens its PDF at the indexed page, and `v` starts
 another semantic query.
 
@@ -113,6 +117,7 @@ grimoire --json list --query "visual representation" --tag video
 grimoire --json show vaswani-2017-attention
 grimoire --json search "transformer architecture"
 grimoire --json semantic "limitations of self-supervised video models"
+grimoire --json semantic "monotone convergence theorem" --exact
 grimoire --json semantic "limitations" --per-paper 3
 grimoire --json semantic "limitations" --group passages
 grimoire --json semantic "limitations" --limit 100 --offset 100
@@ -144,6 +149,28 @@ semantics.
     vaswani-2017-attention.pdf
   lecun-2015-deep/
     info.toml
+  abbott-2015-understanding/
+    info.toml
+    Abbott-Understanding_Analysis.pdf
+    derived/docling/
+      document.json
+      passages.jsonl
+```
+
+Books use the same directory layout and citation key scheme. Their metadata is
+flat and backward-compatible with existing paper entries:
+
+```toml
+kind = "book"
+title = "Understanding Analysis"
+authors = ["Stephen Abbott"]
+year = 2015
+edition = "2"
+publisher = "Springer"
+series = "Undergraduate Texts in Mathematics"
+isbn = ["978-1-4939-2711-1", "978-1-4939-2712-8"]
+doi = "10.1007/978-1-4939-2712-8"
+files = ["Abbott-Understanding_Analysis.pdf"]
 ```
 
 Directory naming: `{first-author}-{year}-{first-title-word}`.
@@ -222,6 +249,9 @@ l = [":insert-output grimoire cite --format latex", ":redraw"]
 - **Publisher landing page** (`https://www.nature.com/articles/…`, ScienceDirect, Springer, etc.) — scrapes the page's `citation_doi` / `citation_pdf_url` meta tags to resolve metadata and, when the PDF is openly available, download it
 - **Direct PDF URL** — downloads only when the response contains PDF data
 - **Local PDF** (`paper.pdf`) — extracts metadata from PDF; if filename looks like an arXiv ID, fetches metadata from arXiv
+- **Local book PDF** — pass `--kind book` plus any explicit `--title`,
+  `--author`, `--year`, `--edition`, `--publisher`, `--series`, `--isbn`, and
+  `--doi` overrides. Metadata overrides require a single local PDF.
 
 > **Prefer the DOI for publisher pages.** Some sites can't be imported from
 > their article URL: JavaScript-rendered pages (e.g. IEEE Xplore) expose no DOI
@@ -238,9 +268,9 @@ deduplicator (`d` in the TUI) groups existing references that share a title
 
 ## Semantic search
 
-`grimoire semantic-index` recursively reads `*.jsonl` files below each paper's
+`grimoire semantic-index` recursively reads `*.jsonl` files below each work's
 `derived/` directory and builds a local passage index in `.grimoire.db`. It
-fingerprints each source by content and paper title, embeds only new or changed
+fingerprints each source by content and work title, embeds only new or changed
 sources, removes entries for deleted sources, and reuses unchanged embeddings.
 Use `semantic-index --force` to rebuild every embedding. Rows
 may come from Docling or another exporter. Grimoire looks for passage content in
@@ -251,23 +281,41 @@ metadata.
 Embeddings use a pinned, Q4 ONNX export of Google's on-device EmbeddingGemma
 300M model. The model is downloaded on first use and cached locally; document
 text is not sent to an embedding API. Run `grimoire semantic "your
-natural-language query"` to rank papers by their strongest passage. Add
-`--per-paper 3` to include more evidence per paper, or `--group passages` to
+natural-language query"` to rank works by their strongest passage. Add
+`--per-paper 3` to include more evidence per work, or `--group passages` to
 return the original global passage ranking.
 
-The TUI uses the same paper-first ranking. Press `v` to search; lowercase `p`
-toggles between a paper and its ranked passages, while uppercase `P` toggles
-between grouped papers and the global raw-passage ranking. `l` or Right also
-opens a paper, and `h` or Left returns from either passage view. Set
+For terms where exact wording matters, `--exact` first retains passages that
+contain every indexable query term in the passage text or headings, then
+orders those matches by cosine similarity. This keeps the displayed similarity
+score meaningful while helping with theorem names and LaTeX command names.
+
+`grimoire import-derived <key> --docling <document.json>` preserves the source
+Docling JSON and creates `derived/docling/passages.jsonl`. Page furniture is
+discarded; headings, page numbers, prose, lists, code, and normalized LaTeX
+formula blocks are retained. Picture-internal OCR (individual diagram labels,
+ticks, and glyphs) is excluded from prose passages. The PDF remains the source
+of truth. The importer does not copy Docling page-render PNGs.
+
+In Kitty, semantic passage previews use Docling's page provenance to crop
+formulae from the source PDF and render the original typesetting. This avoids
+displaying damaged extraction output when Docling's generated LaTeX is
+incomplete. If the provenance, PDF, Kitty graphics support, or `pdftoppm` is
+unavailable, Grimoire leaves the extracted formula text visible as a fallback.
+
+The TUI uses the same work-first ranking. Press `v` to search; lowercase `p`
+toggles between a work and its ranked passages, while uppercase `P` toggles
+between grouped works and the global raw-passage ranking. `l` or Right also
+opens a work, and `h` or Left returns from either passage view. Set
 `semantic_results` to a positive number only if you want to cap results in any
-TUI view. It hydrates 100 papers or passages initially and automatically loads
+TUI view. It hydrates 100 works or passages initially and automatically loads
 another page near the end; its status names the active unit and reports loaded
 and total counts.
 
-The CLI returns 100 papers by default, accepts `--limit` and `--offset` for
+The CLI returns 100 works by default, accepts `--limit` and `--offset` for
 paging, and requires `--all` for an intentionally unbounded response. Grouped
 JSON includes `total_passages` alongside `total`, `offset`, `returned`, and
-`next_offset`; each paper includes its best score, match count, and requested
+`next_offset`; each work includes its best score, match count, and requested
 passages. Re-run
 `semantic-index` after
 regenerating the JSONL files; unchanged

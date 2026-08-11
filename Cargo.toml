@@ -5,12 +5,14 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
+base64 = "0.23"
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 crossterm = { version = "0.28", features = ["use-dev-tty"] }
 dirs = "6"
 fastembed = { version = "5.17.4", default-features = false, features = ["ort-download-binaries-native-tls"] }
 flate2 = "1.1.9"
+image = { version = "0.25", default-features = false, features = ["png"] }
 lopdf = "0.34"
 nucleo-matcher = "0.3"
 quick-xml = "0.37"
