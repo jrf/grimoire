@@ -2555,7 +2555,7 @@ fn draw(f: &mut Frame, app: &mut App) {
                     list_inner,
                 );
             } else {
-                let excerpt_width = list_width.saturating_sub(6).max(8);
+                let item_width = list_width.saturating_sub(3).max(8);
                 let items: Vec<ListItem> = match &view.results {
                     SemanticResults::Papers(papers) => papers
                         .iter()
@@ -2575,39 +2575,38 @@ fn draw(f: &mut Frame, app: &mut App) {
                                 )
                             };
                             let compact = hit.text.split_whitespace().collect::<Vec<_>>().join(" ");
-                            Some(ListItem::new(vec![
-                                Line::from(vec![
-                                    Span::styled(format!(" {:>2}. ", rank + 1), s_date),
-                                    Span::styled(format!("{:.3}  ", paper.similarity), s_hl),
-                                    Span::styled(paper.paper_title.as_str(), s_text),
-                                ]),
-                                Line::from(vec![
-                                    Span::styled(
-                                        format!(
-                                            "  {} passage{} ›",
-                                            paper.matching_passages,
-                                            if paper.matching_passages == 1 {
-                                                ""
-                                            } else {
-                                                "s"
-                                            }
-                                        ),
-                                        s_author,
-                                    ),
-                                    Span::styled(
-                                        if heading.is_empty() {
-                                            String::new()
-                                        } else {
-                                            format!(" · best match {heading}")
-                                        },
-                                        s_date,
-                                    ),
-                                ]),
-                                Line::from(Span::styled(
-                                    format!("  {}", truncate_ellipsis(&compact, excerpt_width)),
-                                    s_dim,
-                                )),
-                            ]))
+                            let mut lines = semantic_ranked_title_lines(
+                                rank,
+                                paper.similarity,
+                                &paper.paper_title,
+                                item_width,
+                                s_date,
+                                s_hl,
+                                s_text,
+                            );
+                            lines.push(Line::from(Span::styled(
+                                format!(
+                                    "  {} passage{} ›",
+                                    paper.matching_passages,
+                                    if paper.matching_passages == 1 {
+                                        ""
+                                    } else {
+                                        "s"
+                                    }
+                                ),
+                                s_author,
+                            )));
+                            if !heading.is_empty() {
+                                lines.extend(semantic_wrapped_lines(
+                                    &format!("best match {heading}"),
+                                    s_date,
+                                    item_width,
+                                    2,
+                                    2,
+                                ));
+                            }
+                            lines.extend(semantic_wrapped_lines(&compact, s_dim, item_width, 2, 2));
+                            Some(ListItem::new(lines))
                         })
                         .collect(),
                     SemanticResults::Passages(passages) => passages
@@ -2621,26 +2620,31 @@ fn draw(f: &mut Frame, app: &mut App) {
                                 format!("  {}", semantic_heading_text(&hit.headings))
                             };
                             let compact = hit.text.split_whitespace().collect::<Vec<_>>().join(" ");
-                            ListItem::new(vec![
-                                Line::from(vec![
-                                    Span::styled(format!(" {:>2}. ", rank + 1), s_date),
-                                    Span::styled(format!("{:.3}  ", hit.similarity), s_hl),
-                                    Span::styled(hit.paper_title.as_str(), s_text),
-                                    Span::styled(
-                                        if location.is_empty() {
-                                            String::new()
-                                        } else {
-                                            format!(" · {location}")
-                                        },
-                                        s_hl,
-                                    ),
-                                ]),
-                                Line::from(Span::styled(heading, s_author)),
-                                Line::from(Span::styled(
-                                    format!("  {}", truncate_ellipsis(&compact, excerpt_width)),
-                                    s_dim,
-                                )),
-                            ])
+                            let title = if location.is_empty() {
+                                hit.paper_title.clone()
+                            } else {
+                                format!("{} · {location}", hit.paper_title)
+                            };
+                            let mut lines = semantic_ranked_title_lines(
+                                rank,
+                                hit.similarity,
+                                &title,
+                                item_width,
+                                s_date,
+                                s_hl,
+                                s_text,
+                            );
+                            if !heading.is_empty() {
+                                lines.extend(semantic_wrapped_lines(
+                                    heading.trim(),
+                                    s_author,
+                                    item_width,
+                                    2,
+                                    2,
+                                ));
+                            }
+                            lines.extend(semantic_wrapped_lines(&compact, s_dim, item_width, 2, 2));
+                            ListItem::new(lines)
                         })
                         .collect(),
                 };
@@ -3328,6 +3332,71 @@ fn semantic_location(hit: &SearchHit) -> String {
     }
 }
 
+fn semantic_ranked_title_lines(
+    rank: usize,
+    similarity: f32,
+    title: &str,
+    width: usize,
+    rank_style: Style,
+    similarity_style: Style,
+    title_style: Style,
+) -> Vec<Line<'static>> {
+    let rank = format!(" {:>2}. ", rank + 1);
+    let similarity = format!("{similarity:.3}  ");
+    let prefix_width = rank.chars().count() + similarity.chars().count();
+    let title_width = width.saturating_sub(prefix_width).max(1);
+    let mut title_lines = limited_wrapped_text(title, title_width, 2).into_iter();
+    let first = title_lines.next().unwrap_or_default();
+    let mut lines = vec![Line::from(vec![
+        Span::styled(rank, rank_style),
+        Span::styled(similarity, similarity_style),
+        Span::styled(first, title_style),
+    ])];
+    lines.extend(title_lines.map(|line| {
+        Line::from(vec![
+            Span::raw(" ".repeat(prefix_width)),
+            Span::styled(line, title_style),
+        ])
+    }));
+    lines
+}
+
+fn semantic_wrapped_lines(
+    text: &str,
+    style: Style,
+    width: usize,
+    indent: usize,
+    max_lines: usize,
+) -> Vec<Line<'static>> {
+    let content_width = width.saturating_sub(indent).max(1);
+    limited_wrapped_text(text, content_width, max_lines)
+        .into_iter()
+        .map(|line| {
+            Line::from(vec![
+                Span::raw(" ".repeat(indent)),
+                Span::styled(line, style),
+            ])
+        })
+        .collect()
+}
+
+fn limited_wrapped_text(text: &str, width: usize, max_lines: usize) -> Vec<String> {
+    let mut lines = wrap_text(text, width.max(1));
+    if max_lines == 0 {
+        return Vec::new();
+    }
+    if lines.len() > max_lines {
+        lines.truncate(max_lines);
+        if let Some(last) = lines.last_mut() {
+            while last.chars().count() >= width.max(1) {
+                last.pop();
+            }
+            last.push('…');
+        }
+    }
+    lines
+}
+
 fn semantic_heading_text(headings: &[String]) -> String {
     format!("{}  ", headings.join(" › "))
 }
@@ -3804,9 +3873,9 @@ mod tests {
     use std::process::Command;
 
     use super::{
-        LayoutMode, SemanticPassageBlock, formula_cell_size, picker_rect, prepare_reader_command,
-        preview_authors, semantic_error_message, semantic_heading_text, semantic_passage_blocks,
-        semantic_passage_lines, should_load_more_semantic,
+        LayoutMode, SemanticPassageBlock, formula_cell_size, limited_wrapped_text, picker_rect,
+        prepare_reader_command, preview_authors, semantic_error_message, semantic_heading_text,
+        semantic_passage_blocks, semantic_passage_lines, should_load_more_semantic,
     };
     use ratatui::layout::Rect;
 
@@ -3970,5 +4039,13 @@ mod tests {
         assert!(!should_load_more_semantic(20, 100, 14_887));
         assert!(should_load_more_semantic(90, 100, 14_887));
         assert!(!should_load_more_semantic(99, 100, 100));
+    }
+
+    #[test]
+    fn semantic_result_text_wraps_to_a_bounded_number_of_lines() {
+        assert_eq!(
+            limited_wrapped_text("one two three four", 7, 2),
+            ["one two", "three…"]
+        );
     }
 }
