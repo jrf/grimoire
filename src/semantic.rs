@@ -167,11 +167,11 @@ impl SearchRanking {
         anyhow::ensure!(limit > 0, "Semantic search limit must be greater than zero");
         anyhow::ensure!(
             per_paper > 0,
-            "Semantic passages per paper must be greater than zero"
+            "Semantic passages per work must be greater than zero"
         );
         anyhow::ensure!(
             offset <= self.papers.len(),
-            "Semantic search offset {offset} exceeds {} papers",
+            "Semantic search offset {offset} exceeds {} works",
             self.papers.len()
         );
         let end = offset.saturating_add(limit).min(self.papers.len());
@@ -188,7 +188,7 @@ impl SearchRanking {
             )?;
             let best = passages
                 .first()
-                .context("Ranked paper has no semantic passages")?;
+                .context("Ranked work has no semantic passages")?;
             hits.push(PaperSearchHit {
                 dir_name: ranked.dir_name.clone(),
                 paper_title: best.paper_title.clone(),
@@ -220,10 +220,10 @@ impl SearchRanking {
             .papers
             .iter()
             .find(|paper| paper.dir_name == dir_name)
-            .with_context(|| format!("Paper {dir_name:?} is not in the semantic results"))?;
+            .with_context(|| format!("Work {dir_name:?} is not in the semantic results"))?;
         anyhow::ensure!(
             offset <= paper.chunks.len(),
-            "Semantic search offset {offset} exceeds {} passages for this paper",
+            "Semantic search offset {offset} exceeds {} passages for this work",
             paper.chunks.len()
         );
         let end = offset.saturating_add(limit).min(paper.chunks.len());
@@ -289,7 +289,7 @@ pub fn build(
     let (sources, report) = collect_sources(library)?;
     if report.chunks == 0 {
         anyhow::bail!(
-            "No indexable JSONL rows found below paper derived/ directories ({} files, {} skipped, {} malformed)",
+            "No indexable JSONL rows found below work derived/ directories ({} files, {} skipped, {} malformed)",
             report.files,
             report.skipped,
             report.malformed
@@ -453,11 +453,15 @@ fn embedding_progress_line(
 }
 
 pub fn rank(library: &Path, query: &str, config: &EmbeddingConfig) -> Result<SearchRanking> {
-    rank_inner(library, query, config, true)
+    rank_inner(library, query, config, true, false)
+}
+
+pub fn rank_exact(library: &Path, query: &str, config: &EmbeddingConfig) -> Result<SearchRanking> {
+    rank_inner(library, query, config, true, true)
 }
 
 pub fn rank_silent(library: &Path, query: &str, config: &EmbeddingConfig) -> Result<SearchRanking> {
-    rank_inner(library, query, config, false)
+    rank_inner(library, query, config, false, false)
 }
 
 fn rank_inner(
@@ -465,6 +469,7 @@ fn rank_inner(
     query: &str,
     config: &EmbeddingConfig,
     show_download_progress: bool,
+    exact: bool,
 ) -> Result<SearchRanking> {
     validate_embedding_config(config)?;
     let query = query.trim();
@@ -496,7 +501,7 @@ fn rank_inner(
         query_embedding.len()
     );
 
-    similarity_ranking(&conn, &query_embedding)
+    similarity_ranking(&conn, &query_embedding, exact.then_some(query))
 }
 
 pub fn print_page(page: &SearchPage) {
@@ -1041,11 +1046,33 @@ fn plan_index(
     }
 
     let mut statement = conn.prepare("SELECT source_path, fingerprint FROM semantic_source")?;
-    let stored = statement
+    let mut stored = statement
         .query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?
         .collect::<std::result::Result<HashMap<_, _>, _>>()?;
+    drop(statement);
+
+    // An interrupted legacy migration can leave a valid semantic_chunk table
+    // with only some source fingerprints recorded. Verify those missing rows
+    // against the stored chunks and heal the bookkeeping without re-embedding
+    // content that is already present and unchanged.
+    let indexed_paths: HashSet<String> = conn
+        .prepare("SELECT DISTINCT source_path FROM semantic_chunk")?
+        .query_map([], |row| row.get(0))?
+        .collect::<std::result::Result<_, _>>()?;
+    for source in sources {
+        if !stored.contains_key(&source.source_path)
+            && indexed_paths.contains(&source.source_path)
+            && stored_source_matches(conn, source)?
+        {
+            conn.execute(
+                "INSERT INTO semantic_source (source_path, fingerprint) VALUES (?1, ?2)",
+                params![source.source_path, source.fingerprint],
+            )?;
+            stored.insert(source.source_path.clone(), source.fingerprint.clone());
+        }
+    }
     let current: HashMap<&str, &str> = sources
         .iter()
         .map(|source| (source.source_path.as_str(), source.fingerprint.as_str()))
@@ -1318,7 +1345,14 @@ fn semantic_meta(conn: &Connection, key: &str) -> Option<String> {
     .ok()
 }
 
-fn similarity_ranking(conn: &Connection, query_embedding: &[f32]) -> Result<SearchRanking> {
+fn similarity_ranking(
+    conn: &Connection,
+    query_embedding: &[f32],
+    exact_query: Option<&str>,
+) -> Result<SearchRanking> {
+    let exact_ids = exact_query
+        .map(|query| exact_match_ids(conn, query))
+        .transpose()?;
     let mut statement = conn.prepare("SELECT id, dir_name, embedding FROM semantic_chunk")?;
     let rows = statement.query_map([], |row| {
         Ok((
@@ -1331,6 +1365,12 @@ fn similarity_ranking(conn: &Connection, query_embedding: &[f32]) -> Result<Sear
     let mut chunks = Vec::new();
     for row in rows {
         let (id, dir_name, bytes) = row?;
+        if exact_ids
+            .as_ref()
+            .is_some_and(|matching| !matching.contains(&id))
+        {
+            continue;
+        }
         let embedding = decode_embedding(&bytes)?;
         let similarity = cosine_similarity(query_embedding, &embedding)?;
         chunks.push(RankedChunk {
@@ -1355,6 +1395,35 @@ fn similarity_ranking(conn: &Connection, query_embedding: &[f32]) -> Result<Sear
         }
     }
     Ok(SearchRanking { chunks, papers })
+}
+
+fn exact_match_ids(conn: &Connection, query: &str) -> Result<HashSet<i64>> {
+    let terms = exact_terms(query);
+    anyhow::ensure!(
+        !terms.is_empty(),
+        "Exact semantic search query has no indexable terms"
+    );
+    let query = terms
+        .iter()
+        .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut statement =
+        conn.prepare("SELECT rowid FROM semantic_chunk_fts WHERE semantic_chunk_fts MATCH ?1")?;
+    let rows = statement.query_map([query], |row| row.get(0))?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
+fn exact_terms(query: &str) -> Vec<String> {
+    let mut terms = query
+        .split(|character: char| !character.is_alphanumeric() && character != '_')
+        .map(|term| term.trim_matches('_'))
+        .filter(|term| term.chars().count() > 1)
+        .map(str::to_lowercase)
+        .collect::<Vec<_>>();
+    terms.sort();
+    terms.dedup();
+    terms
 }
 
 fn encode_embedding(embedding: &[f32]) -> Vec<u8> {
@@ -1406,8 +1475,8 @@ mod tests {
     use super::{
         ChunkRecord, DEFAULT_MODEL_ID, IndexPlan, IndexReport, SourceRecord, collect_sources,
         cosine_similarity, decode_embedding, document_input, embedding_progress_line,
-        encode_embedding, model_id, normalize_row, open_index, page_values, passage_preview,
-        plan_index, query_input, replace_index, similarity_ranking, update_index,
+        encode_embedding, exact_terms, model_id, normalize_row, open_index, page_values,
+        passage_preview, plan_index, query_input, replace_index, similarity_ranking, update_index,
         validate_embedding_config,
     };
     use crate::config::EmbeddingConfig;
@@ -1561,7 +1630,7 @@ mod tests {
         )
         .unwrap();
 
-        let ranking = similarity_ranking(&conn, &[1.0, 0.0]).unwrap();
+        let ranking = similarity_ranking(&conn, &[1.0, 0.0], None).unwrap();
         assert_eq!(ranking.total(), 2);
         assert_eq!(ranking.paper_total(), 1);
         let first = ranking.page(library.path(), 0, 1).unwrap();
@@ -1572,6 +1641,44 @@ mod tests {
         let second = ranking.page(library.path(), 1, 1).unwrap();
         assert!(first.hits[0].similarity >= second.hits[0].similarity);
         assert_eq!(second.next_offset, None);
+    }
+
+    #[test]
+    fn exact_search_filters_then_orders_by_similarity() {
+        let library = tempfile::tempdir().unwrap();
+        let source = SourceRecord {
+            source_path: "synthetic-book/derived/passages.jsonl".to_string(),
+            fingerprint: "first".to_string(),
+            chunks: vec![
+                synthetic_chunk("Synthetic Book", "A passage about compactness", 0),
+                synthetic_chunk(
+                    "Synthetic Book",
+                    "The monotone convergence theorem applies here",
+                    1,
+                ),
+                synthetic_chunk("Synthetic Book", "Another monotone sequence example", 2),
+            ],
+        };
+        let conn = open_index(library.path()).unwrap();
+        replace_index(
+            &conn,
+            &[source],
+            &[vec![1.0, 0.0], vec![0.8, 0.6], vec![0.9, 0.435_889_9]],
+            2,
+            "synthetic-model",
+        )
+        .unwrap();
+
+        let ranking = similarity_ranking(&conn, &[1.0, 0.0], Some("monotone")).unwrap();
+        let page = ranking.page(library.path(), 0, 10).unwrap();
+        assert_eq!(page.total, 2);
+        assert_eq!(page.hits[0].chunk_index, 2);
+        assert_eq!(page.hits[1].chunk_index, 1);
+        assert!(page.hits[0].similarity > page.hits[1].similarity);
+        assert_eq!(
+            exact_terms(r"x_n \\epsilon convergence"),
+            ["convergence", "epsilon", "x_n"]
+        );
     }
 
     #[test]
@@ -1599,7 +1706,7 @@ mod tests {
         )
         .unwrap();
 
-        let ranking = similarity_ranking(&conn, &[1.0, 0.0]).unwrap();
+        let ranking = similarity_ranking(&conn, &[1.0, 0.0], None).unwrap();
         assert_eq!(ranking.total(), 3);
         assert_eq!(ranking.paper_total(), 2);
 
@@ -1748,6 +1855,39 @@ mod tests {
             )
             .unwrap();
         assert_eq!(fingerprint, "fingerprint");
+    }
+
+    #[test]
+    fn partial_fingerprint_table_is_healed_without_reembedding() {
+        let library = tempfile::tempdir().unwrap();
+        let conn = open_index(library.path()).unwrap();
+        let first = synthetic_source("first.jsonl", "first");
+        let second = synthetic_source("second.jsonl", "second");
+        replace_index(
+            &conn,
+            &[first.clone(), second.clone()],
+            &[vec![1.0, 0.0], vec![0.0, 1.0]],
+            2,
+            "synthetic-model",
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM semantic_source WHERE source_path = ?1",
+            [&second.source_path],
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan_index(&conn, &[first, second], "synthetic-model", false).unwrap(),
+            IndexPlan::Incremental {
+                changed: Default::default(),
+                deleted: Vec::new(),
+            }
+        );
+        let fingerprints: usize = conn
+            .query_row("SELECT count(*) FROM semantic_source", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(fingerprints, 2);
     }
 
     fn synthetic_source(source_path: &str, fingerprint: &str) -> SourceRecord {

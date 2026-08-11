@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 
 use crate::metadata;
-use crate::model::Reference;
+use crate::model::{Reference, ReferenceKind};
 use crate::storage;
 
 /// A reference paired with its citation key (the library directory name),
@@ -90,9 +90,13 @@ fn family_given(author: &str) -> String {
     }
 }
 
-/// Render a single reference as a BibTeX `@article` entry.
+/// Render a single reference as a BibTeX entry.
 pub fn to_bibtex(cite_key: &str, r: &Reference) -> String {
-    let mut bib = format!("@article{{{cite_key},\n");
+    let entry_type = match r.kind {
+        ReferenceKind::Paper => "article",
+        ReferenceKind::Book => "book",
+    };
+    let mut bib = format!("@{entry_type}{{{cite_key},\n");
     bib.push_str(&format!("  title = {{{}}},\n", r.title));
     let authors = r
         .authors
@@ -108,6 +112,18 @@ pub fn to_bibtex(cite_key: &str, r: &Reference) -> String {
     }
     if let Some(ref journal) = r.journal {
         bib.push_str(&format!("  journal = {{{journal}}},\n"));
+    }
+    if let Some(ref publisher) = r.publisher {
+        bib.push_str(&format!("  publisher = {{{publisher}}},\n"));
+    }
+    if let Some(ref edition) = r.edition {
+        bib.push_str(&format!("  edition = {{{edition}}},\n"));
+    }
+    if let Some(ref series) = r.series {
+        bib.push_str(&format!("  series = {{{series}}},\n"));
+    }
+    if !r.isbn.is_empty() {
+        bib.push_str(&format!("  isbn = {{{}}},\n", r.isbn.join(", ")));
     }
     if let Some(ref doi) = r.doi {
         bib.push_str(&format!("  doi = {{{doi}}},\n"));
@@ -167,7 +183,11 @@ fn to_hayagriva(r: &Reference) -> HayagrivaEntry {
     };
 
     HayagrivaEntry {
-        entry_type: "article".to_string(),
+        entry_type: match r.kind {
+            ReferenceKind::Paper => "article",
+            ReferenceKind::Book => "book",
+        }
+        .to_string(),
         title: r.title.clone(),
         author: r.authors.iter().map(|a| family_given(a)).collect(),
         date: r.year,
@@ -177,5 +197,34 @@ fn to_hayagriva(r: &Reference) -> HayagrivaEntry {
         }),
         serial_number: serial,
         r#abstract: r.r#abstract.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::to_bibtex;
+    use crate::model::Reference;
+
+    #[test]
+    fn exports_books_as_bibtex_books() {
+        let reference: Reference = toml::from_str(
+            r#"
+            kind = "book"
+            title = "Synthetic Analysis"
+            authors = ["Ada Example"]
+            year = 2026
+            edition = "2"
+            publisher = "Example Press"
+            series = "Synthetic Mathematics"
+            isbn = ["978-0-00-000000-0"]
+            "#,
+        )
+        .unwrap();
+
+        let bibtex = to_bibtex("example-2026-synthetic", &reference);
+        assert!(bibtex.starts_with("@book{example-2026-synthetic,"));
+        assert!(bibtex.contains("publisher = {Example Press}"));
+        assert!(bibtex.contains("edition = {2}"));
+        assert!(bibtex.contains("isbn = {978-0-00-000000-0}"));
     }
 }

@@ -12,7 +12,7 @@
 - [ ] Expand unit tests (storage dir-naming, export rendering, dedup grouping) + CI hardening (`cargo audit`, `--locked`) #chore
 - [ ] `validate`: detect orphan PDFs on disk, structured (deserialize→edit→serialize) `--fix` #improvement
 - [ ] `grimoire related` via Semantic Scholar API #feature
-- [ ] Math-textbook retrieval: preserve LaTeX, headings, pages, and surrounding prose during extraction/chunking; combine semantic similarity with FTS for symbols, theorem names, and exact expressions; distinguish indexed passage counts from similarity matches #feature
+- [ ] Book-derived media: import only Docling figures and tables referenced by passages, preserve their captions/page provenance, and avoid full-page render artifacts #feature
 - [ ] APA/Chicago formatted citation output #feature
 
 ## Later
@@ -27,6 +27,7 @@
 
 ## Done
 
+- [x] First-class books and math-textbook retrieval: book metadata/import, Docling structure-aware passages with LaTeX/headings/pages/prose, and exact-term-filtered semantic ranking #feature
 - [x] `grimoire backfill`: fill missing PDFs (Unpaywall repo-first → CrossRef) and abstracts for existing entries; `--pdfs-only`/`--abstracts-only`/`--check`, additive-only #feature
 - [x] Wrap long titles in the browse list instead of truncating; drop the `>` selection arrow (background highlight suffices) #improvement
 - [x] Import coverage: publisher landing pages (`citation_*` meta tags), PubMed/PMID, and DOI-embedded-in-URL #feature

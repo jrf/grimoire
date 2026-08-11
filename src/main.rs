@@ -2,10 +2,13 @@ mod backfill;
 mod cli;
 mod config;
 mod dedup;
+mod docling;
 mod enrich;
 mod export;
 mod fetch;
+mod formula;
 mod index;
+mod kitty;
 mod metadata;
 mod model;
 mod semantic;
@@ -21,6 +24,7 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
 use config::Config;
+use model::ReferenceKind;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum SemanticGroup {
@@ -29,7 +33,7 @@ enum SemanticGroup {
 }
 
 #[derive(Parser)]
-#[command(name = "grimoire", version, about = "A fast TUI reference manager")]
+#[command(name = "grimoire", version, about = "A fast scholarly library")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -76,6 +80,41 @@ enum Command {
         /// Import even if an entry with the same DOI or title already exists
         #[arg(short, long)]
         force: bool,
+        /// Type of local work being imported
+        #[arg(long, value_enum, default_value_t = ReferenceKind::Paper)]
+        kind: ReferenceKind,
+        /// Override the PDF title (single input only)
+        #[arg(long)]
+        title: Option<String>,
+        /// Override the author list (repeatable; single input only)
+        #[arg(long = "author")]
+        authors: Vec<String>,
+        /// Override the publication year (single input only)
+        #[arg(long)]
+        year: Option<u16>,
+        /// Book edition (single input only)
+        #[arg(long)]
+        edition: Option<String>,
+        /// Book publisher (single input only)
+        #[arg(long)]
+        publisher: Option<String>,
+        /// Book series (single input only)
+        #[arg(long)]
+        series: Option<String>,
+        /// Book ISBN (repeatable; single input only)
+        #[arg(long)]
+        isbn: Vec<String>,
+        /// Override the DOI (single input only)
+        #[arg(long)]
+        doi: Option<String>,
+    },
+    /// Import Docling JSON as structured passages for an existing work
+    ImportDerived {
+        /// Existing library key
+        key: String,
+        /// Docling JSON document to preserve and convert to passages
+        #[arg(long)]
+        docling: PathBuf,
     },
     /// Pick a reference and output its citation key
     Cite {
@@ -169,18 +208,18 @@ enum Command {
     },
     /// Rebuild the search index from filesystem
     Reindex,
-    /// Build a local vector index from JSONL files under each paper's derived directory
+    /// Build a local vector index from JSONL files under each work's derived directory
     SemanticIndex {
         /// Re-embed every passage even when its source is unchanged
         #[arg(long)]
         force: bool,
     },
-    /// Search indexed papers or passages by semantic similarity
+    /// Search indexed works or passages by semantic similarity
     Semantic {
         /// Natural-language search query
         #[arg(required = true)]
         query: Vec<String>,
-        /// Number of papers or passages to return (defaults to 100)
+        /// Number of works or passages to return (defaults to 100)
         #[arg(short, long, conflicts_with = "all")]
         limit: Option<usize>,
         /// Zero-based result offset
@@ -189,12 +228,15 @@ enum Command {
         /// Return every result from the offset onward
         #[arg(long)]
         all: bool,
-        /// Group results by paper, or return the raw passage ranking
+        /// Group results by work (`papers`, retained for compatibility), or return passages
         #[arg(long, value_enum, default_value = "papers")]
         group: SemanticGroup,
-        /// Number of ranked passages to include with each paper result
+        /// Number of ranked passages to include with each work result
         #[arg(long)]
         per_paper: Option<usize>,
+        /// Require every exact query term, then rank matches by similarity
+        #[arg(long)]
+        exact: bool,
     },
     /// Validate library integrity (missing PDFs, junk files, temp names)
     Validate {
@@ -295,11 +337,48 @@ fn run(cli: Cli) -> Result<()> {
                 Ok(())
             }
         }
-        Some(Command::Add { paths, force }) => {
-            let report = cmd_add_many(&library, &paths, force)?;
+        Some(Command::Add {
+            paths,
+            force,
+            kind,
+            title,
+            authors,
+            year,
+            edition,
+            publisher,
+            series,
+            isbn,
+            doi,
+        }) => {
+            let options = AddOptions {
+                kind,
+                title,
+                authors,
+                year,
+                edition,
+                publisher,
+                series,
+                isbn,
+                doi,
+            };
+            let report = cmd_add_many(&library, &paths, force, &options)?;
             if cli.json {
                 cli::print_json(report)
             } else {
+                Ok(())
+            }
+        }
+        Some(Command::ImportDerived { key, docling }) => {
+            let directory = cli::reference_dir(&library, &key)?;
+            let report = docling::import(&directory, &docling)?;
+            if cli.json {
+                cli::print_json(report)
+            } else {
+                println!(
+                    "Imported {} passages from {} body blocks ({} formulas, {} pages).",
+                    report.passages, report.body_blocks, report.formulas, report.pages
+                );
+                println!("  → {}", report.passages_path.display());
                 Ok(())
             }
         }
@@ -549,13 +628,18 @@ fn run(cli: Cli) -> Result<()> {
             all,
             group,
             per_paper,
+            exact,
         }) => {
             let query = query.join(" ");
             anyhow::ensure!(
                 group == SemanticGroup::Papers || per_paper.is_none(),
                 "--per-paper can only be used with --group papers"
             );
-            let ranking = semantic::rank(&library, &query, &config.embedding)?;
+            let ranking = if exact {
+                semantic::rank_exact(&library, &query, &config.embedding)?
+            } else {
+                semantic::rank(&library, &query, &config.embedding)?
+            };
             match group {
                 SemanticGroup::Papers => {
                     let per_paper = per_paper.unwrap_or(1);
@@ -640,12 +724,87 @@ struct AddResult {
     keys: Vec<String>,
 }
 
-pub fn cmd_add_many(library: &Path, inputs: &[String], force: bool) -> Result<AddReport> {
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AddOptions {
+    kind: ReferenceKind,
+    title: Option<String>,
+    authors: Vec<String>,
+    year: Option<u16>,
+    edition: Option<String>,
+    publisher: Option<String>,
+    series: Option<String>,
+    isbn: Vec<String>,
+    doi: Option<String>,
+}
+
+impl AddOptions {
+    fn apply(&self, reference: &mut crate::model::Reference) -> Result<()> {
+        anyhow::ensure!(
+            self.kind == ReferenceKind::Book
+                || (self.edition.is_none()
+                    && self.publisher.is_none()
+                    && self.series.is_none()
+                    && self.isbn.is_empty()),
+            "Book metadata options require `--kind book`"
+        );
+        reference.kind = self.kind;
+        if let Some(title) = &self.title {
+            anyhow::ensure!(!title.trim().is_empty(), "Title cannot be empty");
+            reference.title = title.trim().to_string();
+        }
+        if !self.authors.is_empty() {
+            anyhow::ensure!(
+                self.authors.iter().all(|author| !author.trim().is_empty()),
+                "Authors cannot be empty"
+            );
+            reference.authors = self
+                .authors
+                .iter()
+                .map(|author| author.trim().to_string())
+                .collect();
+        }
+        if let Some(year) = self.year {
+            reference.year = Some(year);
+        }
+        reference.edition = self.edition.as_deref().map(str::trim).map(str::to_string);
+        reference.publisher = self.publisher.as_deref().map(str::trim).map(str::to_string);
+        reference.series = self.series.as_deref().map(str::trim).map(str::to_string);
+        if !self.isbn.is_empty() {
+            reference.isbn = self
+                .isbn
+                .iter()
+                .map(|isbn| isbn.trim().to_string())
+                .filter(|isbn| !isbn.is_empty())
+                .collect();
+            anyhow::ensure!(!reference.isbn.is_empty(), "ISBN cannot be empty");
+        }
+        if let Some(doi) = &self.doi {
+            anyhow::ensure!(!doi.trim().is_empty(), "DOI cannot be empty");
+            reference.doi = Some(doi.trim().to_string());
+        }
+        Ok(())
+    }
+
+    fn has_overrides(&self) -> bool {
+        self != &Self::default()
+    }
+}
+
+pub fn cmd_add_many(
+    library: &Path,
+    inputs: &[String],
+    force: bool,
+    options: &AddOptions,
+) -> Result<AddReport> {
+    anyhow::ensure!(
+        inputs.len() == 1 || !options.has_overrides(),
+        "Metadata overrides can only be used when adding one PDF"
+    );
     let mut failures = 0;
     let mut results = Vec::new();
     for input in inputs {
         let before = storage::list_ref_dirs(library)?;
-        match cmd_add(library, input, force) {
+        match cmd_add(library, input, force, options) {
             Ok(()) => {
                 let after = storage::list_ref_dirs(library)?;
                 let mut keys = after
@@ -673,13 +832,18 @@ pub fn cmd_add_many(library: &Path, inputs: &[String], force: bool) -> Result<Ad
     Ok(AddReport { inputs: results })
 }
 
-pub fn cmd_add(library: &Path, input: &str, force: bool) -> Result<()> {
+pub fn cmd_add(library: &Path, input: &str, force: bool, options: &AddOptions) -> Result<()> {
     std::fs::create_dir_all(library)?;
 
     let path = PathBuf::from(input);
     if path.exists() {
-        return add_from_file(library, input, force);
+        return add_from_file(library, input, force, options);
     }
+
+    anyhow::ensure!(
+        !options.has_overrides(),
+        "`--kind` and metadata overrides currently require a local PDF"
+    );
 
     if let Some(arxiv_id) = fetch::detect_arxiv_id(input) {
         return add_from_arxiv(library, &arxiv_id, force);
@@ -906,7 +1070,7 @@ fn add_from_pmc(library: &Path, pmc_id: &str, force: bool) -> Result<()> {
     Ok(())
 }
 
-fn add_from_file(library: &Path, path: &str, force: bool) -> Result<()> {
+fn add_from_file(library: &Path, path: &str, force: bool, options: &AddOptions) -> Result<()> {
     let path = PathBuf::from(path)
         .canonicalize()
         .with_context(|| format!("File not found: {}", path))?;
@@ -933,6 +1097,8 @@ fn add_from_file(library: &Path, path: &str, force: bool) -> Result<()> {
             reference.r#abstract = fetched.r#abstract;
         }
     }
+
+    options.apply(&mut reference)?;
 
     if skip_as_duplicate(library, &reference, force) {
         return Ok(());
@@ -968,12 +1134,18 @@ fn add_from_url(library: &Path, url: &str, force: bool) -> Result<()> {
     let tmp_path = tmp_dir.path().join(&filename);
     std::fs::write(&tmp_path, bytes)?;
 
-    add_from_file(library, tmp_path.to_str().unwrap(), force)
+    add_from_file(
+        library,
+        tmp_path.to_str().unwrap(),
+        force,
+        &AddOptions::default(),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::{Cli, Command, SemanticGroup};
+    use crate::model::ReferenceKind;
     use clap::Parser;
 
     #[test]
@@ -1036,5 +1208,58 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn book_and_docling_commands_parse_explicit_metadata() {
+        let cli = Cli::try_parse_from([
+            "grimoire",
+            "add",
+            "--kind",
+            "book",
+            "--title",
+            "Synthetic Analysis",
+            "--author",
+            "Ada Example",
+            "--year",
+            "2026",
+            "--edition",
+            "2",
+            "synthetic.pdf",
+        ])
+        .unwrap();
+        let Some(Command::Add {
+            kind,
+            title,
+            authors,
+            year,
+            edition,
+            ..
+        }) = cli.command
+        else {
+            panic!("add command was not parsed");
+        };
+        assert_eq!(kind, ReferenceKind::Book);
+        assert_eq!(title.as_deref(), Some("Synthetic Analysis"));
+        assert_eq!(authors, ["Ada Example"]);
+        assert_eq!(year, Some(2026));
+        assert_eq!(edition.as_deref(), Some("2"));
+
+        let cli = Cli::try_parse_from([
+            "grimoire",
+            "import-derived",
+            "example-2026-synthetic",
+            "--docling",
+            "synthetic.json",
+        ])
+        .unwrap();
+        assert!(matches!(cli.command, Some(Command::ImportDerived { .. })));
+
+        let cli = Cli::try_parse_from(["grimoire", "semantic", "monotone convergence", "--exact"])
+            .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Semantic { exact: true, .. })
+        ));
     }
 }

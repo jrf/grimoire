@@ -3,7 +3,7 @@ use regex::Regex;
 use std::io::Read;
 use std::time::Duration;
 
-use crate::model::Reference;
+use crate::model::{Reference, ReferenceKind};
 
 const USER_AGENT: &str = "Grimoire/0.1 (reference manager; mailto:jrfetzer@gmail.com)";
 
@@ -135,12 +135,17 @@ fn fetch_arxiv_from_abs(id_clean: &str) -> Result<Reference> {
     let doi = meta_content(&html, "citation_doi");
 
     Ok(Reference {
+        kind: ReferenceKind::Paper,
         title,
         authors,
         year,
         doi,
         arxiv: Some(id_clean.to_string()),
         journal: None,
+        edition: None,
+        publisher: None,
+        series: None,
+        isbn: vec![],
         tags: vec![],
         files: vec![],
         r#abstract: None,
@@ -383,12 +388,17 @@ fn parse_arxiv_response(xml: &str, arxiv_id: &str) -> Result<Reference> {
     let abstract_text = abstract_text.map(|a| clean_abstract(&a));
 
     Ok(Reference {
+        kind: ReferenceKind::Paper,
         title,
         authors,
         year,
         doi,
         arxiv: Some(arxiv_id.to_string()),
         journal: None,
+        edition: None,
+        publisher: None,
+        series: None,
+        isbn: vec![],
         tags: vec![],
         files: vec![],
         r#abstract: abstract_text,
@@ -448,12 +458,17 @@ fn parse_csl_item(item: &serde_json::Value) -> Reference {
     let abstract_text = item["abstract"].as_str().map(clean_abstract);
 
     Reference {
+        kind: ReferenceKind::Paper,
         title,
         authors,
         year,
         doi,
         arxiv: None,
         journal,
+        edition: None,
+        publisher: None,
+        series: None,
+        isbn: vec![],
         tags: vec![],
         files: vec![],
         r#abstract: abstract_text,

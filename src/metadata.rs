@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use lopdf::Document;
 use std::path::Path;
 
-use crate::model::Reference;
+use crate::model::{Reference, ReferenceKind};
 
 pub fn extract_from_pdf(path: &Path) -> Result<Reference> {
     let doc = Document::load(path).context("Failed to read PDF")?;
@@ -25,12 +25,17 @@ pub fn extract_from_pdf(path: &Path) -> Result<Reference> {
     };
 
     Ok(Reference {
+        kind: ReferenceKind::Paper,
         title,
         authors,
         year: None,
         doi: None,
         arxiv: None,
         journal: None,
+        edition: None,
+        publisher: None,
+        series: None,
+        isbn: vec![],
         tags: vec![],
         files: vec![filename],
         r#abstract: None,

@@ -19,9 +19,10 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::{Frame, Terminal};
 
 use crate::config::Config as AppConfig;
+use crate::formula::{FormulaOverlay, FormulaRenderer, ResolvedFormula};
 use crate::index;
 use crate::metadata;
-use crate::model::Reference;
+use crate::model::{Reference, ReferenceKind};
 use crate::semantic::{self, PaperSearchHit, SearchHit, SearchRanking};
 use crate::storage;
 use crate::theme::{self, Theme};
@@ -100,6 +101,10 @@ pub struct App {
     semantic_input: Option<String>,
     semantic_view: Option<SemanticView>,
     semantic_rx: Option<mpsc::Receiver<std::result::Result<SemanticLoad, String>>>,
+    formula_preview: Vec<Option<ResolvedFormula>>,
+    formula_overlays: Vec<FormulaOverlay>,
+    cell_pixel_width: u16,
+    cell_pixel_height: u16,
 }
 
 struct SemanticView {
@@ -160,7 +165,7 @@ impl SemanticResults {
 impl SemanticScope {
     fn label(&self) -> &'static str {
         match self {
-            Self::Papers => "papers",
+            Self::Papers => "works",
             Self::AllPassages { .. } | Self::PaperPassages { .. } => "passages",
         }
     }
@@ -401,7 +406,7 @@ enum InputMode {
 pub fn browse(config: &AppConfig, library: &Path, initial_query: Option<&str>) -> Result<()> {
     let app = App::new(config, library, Mode::Browse, initial_query)?;
     if app.entries.is_empty() {
-        println!("Library is empty. Use `grimoire add <file.pdf>` to import a paper.");
+        println!("Library is empty. Use `grimoire add <file.pdf>` to import a work.");
         return Ok(());
     }
     run_app(app)
@@ -430,6 +435,7 @@ fn run_app(mut app: App) -> Result<()> {
     std::panic::set_hook(Box::new(move |info| {
         let _ = terminal::disable_raw_mode();
         if let Ok(mut f) = File::options().write(true).open("/dev/tty") {
+            let _ = crate::kitty::delete_all(&mut f);
             let _ = f.execute(LeaveAlternateScreen);
             let _ = f.execute(ResetColor);
             let _ = f.execute(Show);
@@ -443,9 +449,11 @@ fn run_app(mut app: App) -> Result<()> {
     let backend = CrosstermBackend::new(BufWriter::new(tty.try_clone()?));
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
+    let mut formula_renderer = FormulaRenderer::new();
 
-    let result = run_event_loop(&mut terminal, &mut app, &mut tty_ctl);
+    let result = run_event_loop(&mut terminal, &mut app, &mut tty_ctl, &mut formula_renderer);
 
+    formula_renderer.clear(&mut tty_ctl);
     terminal::disable_raw_mode()?;
     tty_ctl.execute(LeaveAlternateScreen)?;
     tty_ctl.execute(ResetColor)?;
@@ -459,9 +467,34 @@ fn run_app(mut app: App) -> Result<()> {
 
 type Term = Terminal<CrosstermBackend<BufWriter<File>>>;
 
-fn run_event_loop(terminal: &mut Term, app: &mut App, tty_ctl: &mut File) -> Result<()> {
+fn run_event_loop(
+    terminal: &mut Term,
+    app: &mut App,
+    tty_ctl: &mut File,
+    formula_renderer: &mut FormulaRenderer,
+) -> Result<()> {
     loop {
+        let hit = app.selected_semantic_hit().cloned();
+        app.formula_preview = if formula_renderer.enabled_for(app.theme.text, app.theme.background)
+        {
+            hit.as_ref().map_or_else(Vec::new, |hit| {
+                formula_renderer.resolve_hit(&app.config.library_dir(), hit)
+            })
+        } else {
+            Vec::new()
+        };
+        app.formula_overlays.clear();
+        if let Ok(size) = terminal::window_size() {
+            app.cell_pixel_width = size.width.checked_div(size.columns).unwrap_or(8).max(1);
+            app.cell_pixel_height = size.height.checked_div(size.rows).unwrap_or(16).max(1);
+        }
         terminal.draw(|f| draw(f, app))?;
+        formula_renderer.render(
+            tty_ctl,
+            &app.formula_overlays,
+            app.theme.text,
+            app.theme.background,
+        );
 
         if app.should_quit {
             return Ok(());
@@ -1039,6 +1072,10 @@ impl App {
             semantic_input: None,
             semantic_view: None,
             semantic_rx: None,
+            formula_preview: Vec::new(),
+            formula_overlays: Vec::new(),
+            cell_pixel_width: 8,
+            cell_pixel_height: 16,
         };
 
         if !app.filter.is_empty() {
@@ -1265,13 +1302,13 @@ impl App {
             let selected = view
                 .list_state
                 .selected()
-                .ok_or_else(|| anyhow::anyhow!("No paper is selected"))?;
+                .ok_or_else(|| anyhow::anyhow!("No work is selected"))?;
             let SemanticResults::Papers(papers) = &view.results else {
-                anyhow::bail!("Semantic paper results are unavailable");
+                anyhow::bail!("Semantic work results are unavailable");
             };
             let paper = papers
                 .get(selected)
-                .ok_or_else(|| anyhow::anyhow!("Selected paper is unavailable"))?;
+                .ok_or_else(|| anyhow::anyhow!("Selected work is unavailable"))?;
             let dir_name = paper.dir_name.clone();
             let paper_loaded = papers.len();
             let ranking = view
@@ -1295,7 +1332,7 @@ impl App {
         })();
         if let Err(error) = result {
             self.flash = Some((
-                format!("Could not load passages for this paper: {error}"),
+                format!("Could not load passages for this work: {error}"),
                 std::time::Instant::now(),
             ));
         }
@@ -1339,7 +1376,7 @@ impl App {
             }
             Err(error) => {
                 self.flash = Some((
-                    format!("Could not return to paper results: {error}"),
+                    format!("Could not return to work results: {error}"),
                     std::time::Instant::now(),
                 ));
                 false
@@ -2144,11 +2181,11 @@ fn compute_diffs(old: &Reference, new: &Reference) -> Vec<(String, String, Strin
 }
 
 fn needs_enrich(r: &Reference) -> bool {
-    r.year.is_none()
-        || r.year == Some(0)
-        || r.authors.is_empty()
-        || r.r#abstract.is_none()
-        || r.doi.is_none()
+    let core_missing = r.year.is_none() || r.year == Some(0) || r.authors.is_empty();
+    match r.kind {
+        ReferenceKind::Paper => core_missing || r.r#abstract.is_none() || r.doi.is_none(),
+        ReferenceKind::Book => core_missing || r.publisher.is_none(),
+    }
 }
 
 fn is_importable(input: &str) -> bool {
@@ -2381,11 +2418,11 @@ fn draw(f: &mut Frame, app: &mut App) {
             ]),
             SemanticScope::AllPassages { .. } => bottom_spans.extend([
                 Span::styled(" P", s_author.add_modifier(Modifier::BOLD)),
-                Span::styled(" papers  ", s_text),
+                Span::styled(" works  ", s_text),
             ]),
             SemanticScope::PaperPassages { .. } => bottom_spans.extend([
                 Span::styled(" p", s_link.add_modifier(Modifier::BOLD)),
-                Span::styled(" papers  ", s_text),
+                Span::styled(" works  ", s_text),
                 Span::styled("P", s_author.add_modifier(Modifier::BOLD)),
                 Span::styled(" all passages  ", s_text),
             ]),
@@ -2400,7 +2437,7 @@ fn draw(f: &mut Frame, app: &mut App) {
                 if view.scope.is_expanded() {
                     " back "
                 } else {
-                    " papers "
+                    " works "
                 },
                 s_text,
             ),
@@ -2454,9 +2491,9 @@ fn draw(f: &mut Frame, app: &mut App) {
     };
 
     if show_list {
-        let list_title = app.semantic_view.as_ref().map_or(" Papers ", |view| {
+        let list_title = app.semantic_view.as_ref().map_or(" Library ", |view| {
             if matches!(&view.scope, SemanticScope::Papers) {
-                " Papers "
+                " Works "
             } else {
                 " Passages "
             }
@@ -2620,7 +2657,7 @@ fn draw(f: &mut Frame, app: &mut App) {
             let is_query_importable = is_importable(&app.filter);
             let msg = if is_query_importable {
                 vec![
-                    Line::from(Span::styled("No papers match this query.", s_dim)),
+                    Line::from(Span::styled("No works match this query.", s_dim)),
                     Line::from(""),
                     Line::from(Span::styled(
                         "This query looks like an importable source!",
@@ -2637,7 +2674,7 @@ fn draw(f: &mut Frame, app: &mut App) {
                 ]
             } else {
                 vec![Line::from(Span::styled(
-                    "No papers match this query.",
+                    "No works match this query.",
                     s_dim,
                 ))]
             };
@@ -2741,8 +2778,16 @@ fn draw(f: &mut Frame, app: &mut App) {
             link: s_link,
             date: s_date,
         };
-        if let Some(hit) = app.selected_semantic_hit() {
-            draw_semantic_preview(f, hit, content_area, app.preview_scroll, &styles);
+        if let Some(hit) = app.selected_semantic_hit().cloned() {
+            app.formula_overlays = draw_semantic_preview(
+                f,
+                &hit,
+                content_area,
+                app.preview_scroll,
+                &styles,
+                &app.formula_preview,
+                (app.cell_pixel_width, app.cell_pixel_height),
+            );
         } else {
             draw_preview(f, app, content_area, &styles);
         }
@@ -2995,7 +3040,7 @@ fn draw(f: &mut Frame, app: &mut App) {
             ("e", "Edit info.toml"),
             ("y", "Copy BibTeX"),
             ("o", "Open DOI / arXiv in browser"),
-            ("a", "Add paper (path, DOI, arXiv, URL)"),
+            ("a", "Add work (path, DOI, arXiv, URL)"),
             ("r", "Enrich selected (fetch metadata)"),
             ("R", "Enrich all with missing fields"),
             ("s", "Cycle sort (name/author/year/title)"),
@@ -3022,7 +3067,7 @@ fn draw(f: &mut Frame, app: &mut App) {
             ("enter", "Open PDF at result page"),
             ("space", "Toggle full passage preview"),
             ("v", "Edit semantic query"),
-            ("esc", "Return to papers"),
+            ("esc", "Return to works"),
         ];
 
         let height = help_lines.len() as u16 + 4;
@@ -3084,15 +3129,25 @@ struct Styles {
     date: Style,
 }
 
-fn draw_semantic_preview(f: &mut Frame, hit: &SearchHit, area: Rect, scroll: u16, s: &Styles) {
-    let mut lines = vec![
-        Line::from(""),
-        Line::from(Span::styled(
-            hit.paper_title.as_str(),
-            s.text.add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-    ];
+fn draw_semantic_preview(
+    f: &mut Frame,
+    hit: &SearchHit,
+    area: Rect,
+    scroll: u16,
+    s: &Styles,
+    formulas: &[Option<ResolvedFormula>],
+    cell_pixels: (u16, u16),
+) -> Vec<FormulaOverlay> {
+    let (cell_pixel_width, cell_pixel_height) = cell_pixels;
+    let width = usize::from(area.width.max(1));
+    let mut lines = vec![Line::from("")];
+    push_wrapped_line(
+        &mut lines,
+        hit.paper_title.as_str(),
+        s.text.add_modifier(Modifier::BOLD),
+        width,
+    );
+    lines.push(Line::from(""));
     let pages = match hit.pages.as_slice() {
         [] => String::new(),
         [page] => format!("page {page}"),
@@ -3118,35 +3173,143 @@ fn draw_semantic_preview(f: &mut Frame, hit: &SearchHit, area: Rect, scroll: u16
     ]));
     lines.push(Line::from(""));
     if !hit.headings.is_empty() {
-        lines.push(Line::from(Span::styled(
-            semantic_heading_text(&hit.headings),
+        push_wrapped_line(
+            &mut lines,
+            &semantic_heading_text(&hit.headings),
             s.author,
-        )));
+            width,
+        );
     }
     if !hit.headings.is_empty() {
         lines.push(Line::from(""));
     }
-    lines.extend(
-        semantic_passage_lines(&hit.text, &hit.headings)
-            .into_iter()
-            .map(|line| Line::from(Span::styled(line, s.text))),
-    );
+    let mut placements = Vec::new();
+    let mut formula_index = 0;
+    for block in semantic_passage_blocks(&hit.text, &hit.headings) {
+        match block {
+            SemanticPassageBlock::Text(text) => {
+                if text.is_empty() {
+                    lines.push(Line::from(""));
+                } else {
+                    push_wrapped_line(&mut lines, &text, s.text, width);
+                }
+            }
+            SemanticPassageBlock::Formula(latex) => {
+                let formula = formulas.get(formula_index).and_then(Option::as_ref);
+                formula_index += 1;
+                if let Some(formula) = formula {
+                    let max_columns = area.width.saturating_sub(4).max(1);
+                    let (columns, rows) = formula_cell_size(
+                        formula.pixel_width(),
+                        formula.pixel_height(),
+                        cell_pixel_width,
+                        cell_pixel_height,
+                        max_columns,
+                        12,
+                    );
+                    let line_index = lines.len();
+                    for _ in 0..rows {
+                        lines.push(Line::from(""));
+                    }
+                    placements.push((line_index, columns, rows, formula.clone()));
+                } else {
+                    push_wrapped_line(&mut lines, "\\[", s.dim, width);
+                    push_wrapped_line(&mut lines, &latex, s.text, width);
+                    push_wrapped_line(&mut lines, "\\]", s.dim, width);
+                }
+            }
+        }
+    }
     lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::styled(hit.source_path.as_str(), s.link),
-        Span::styled(" · ", s.dim),
-        Span::styled("chunk ", s.text),
-        Span::styled(
-            hit.chunk_index.to_string(),
-            s.highlight.add_modifier(Modifier::BOLD),
-        ),
-    ]));
+    push_wrapped_line(
+        &mut lines,
+        &format!("{} · chunk {}", hit.source_path, hit.chunk_index),
+        s.link,
+        width,
+    );
 
-    f.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .scroll((scroll, 0)),
-        area,
+    f.render_widget(Paragraph::new(lines).scroll((scroll, 0)), area);
+
+    let scroll = usize::from(scroll);
+    let visible_end = scroll.saturating_add(usize::from(area.height));
+    placements
+        .into_iter()
+        .filter_map(|(line, columns, rows, formula)| {
+            let end = line.saturating_add(usize::from(rows));
+            (line >= scroll && end <= visible_end).then(|| FormulaOverlay {
+                formula,
+                area: Rect::new(
+                    area.x + area.width.saturating_sub(columns) / 2,
+                    area.y + u16::try_from(line - scroll).unwrap_or(u16::MAX),
+                    columns,
+                    rows,
+                ),
+            })
+        })
+        .collect()
+}
+
+fn formula_cell_size(
+    pixel_width: u32,
+    pixel_height: u32,
+    cell_pixel_width: u16,
+    cell_pixel_height: u16,
+    max_columns: u16,
+    max_rows: u16,
+) -> (u16, u16) {
+    let natural_columns = pixel_width
+        .div_ceil(u32::from(cell_pixel_width.max(1)))
+        .max(1);
+    let natural_rows = pixel_height
+        .div_ceil(u32::from(cell_pixel_height.max(1)))
+        .max(1);
+    let scale = (f64::from(max_columns.max(1)) / f64::from(natural_columns))
+        .min(f64::from(max_rows.max(1)) / f64::from(natural_rows))
+        .min(1.0);
+    let columns = (f64::from(natural_columns) * scale).ceil() as u16;
+    let rows = (f64::from(natural_rows) * scale).ceil() as u16;
+    (columns.max(1), rows.max(1))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SemanticPassageBlock {
+    Text(String),
+    Formula(String),
+}
+
+fn semantic_passage_blocks(text: &str, headings: &[String]) -> Vec<SemanticPassageBlock> {
+    let mut blocks = Vec::new();
+    let mut formula: Option<Vec<&str>> = None;
+    for line in semantic_passage_lines(text, headings) {
+        match (line.trim(), formula.as_mut()) {
+            ("\\[" | "$$", None) => formula = Some(Vec::new()),
+            ("\\]" | "$$", Some(lines)) => {
+                let text = lines.join("\n").trim().to_string();
+                if !text.is_empty() {
+                    blocks.push(SemanticPassageBlock::Formula(text));
+                }
+                formula = None;
+            }
+            (_, Some(lines)) => lines.push(line),
+            _ => blocks.push(SemanticPassageBlock::Text(line.to_string())),
+        }
+    }
+    if let Some(lines) = formula {
+        blocks.push(SemanticPassageBlock::Text("\\[".to_string()));
+        blocks.extend(
+            lines
+                .into_iter()
+                .map(|line| SemanticPassageBlock::Text(line.to_string())),
+        );
+    }
+    blocks
+}
+
+fn push_wrapped_line<'a>(lines: &mut Vec<Line<'a>>, text: &str, style: Style, width: usize) {
+    lines.extend(
+        wrap_text(text, width)
+            .into_iter()
+            .map(|line| Line::from(Span::styled(line, style))),
     );
 }
 
@@ -3220,7 +3383,7 @@ fn draw_preview(f: &mut Frame, app: &App, area: ratatui::layout::Rect, s: &Style
             s_text.add_modifier(Modifier::BOLD),
         )));
 
-        if r.year.is_some() || r.journal.is_some() {
+        if r.year.is_some() || r.journal.is_some() || r.kind == ReferenceKind::Book {
             lines.push(Line::from(""));
             let mut parts = Vec::new();
             if let Some(year) = r.year {
@@ -3232,6 +3395,15 @@ fn draw_preview(f: &mut Frame, app: &App, area: ratatui::layout::Rect, s: &Style
                 }
                 parts.push(Span::styled(journal.as_str(), s_dim));
             }
+            if r.kind == ReferenceKind::Book {
+                if !parts.is_empty() {
+                    parts.push(Span::styled(" · ", s_muted));
+                }
+                parts.push(Span::styled("book", s_dim));
+                if let Some(edition) = &r.edition {
+                    parts.push(Span::styled(format!(" · {edition} ed."), s_dim));
+                }
+            }
             lines.push(Line::from(parts));
         }
 
@@ -3240,6 +3412,23 @@ fn draw_preview(f: &mut Frame, app: &App, area: ratatui::layout::Rect, s: &Style
         if !r.authors.is_empty() {
             let author_text = preview_authors(&r.authors);
             lines.push(Line::from(Span::styled(author_text, s_author)));
+            lines.push(Line::from(""));
+        }
+
+        if r.kind == ReferenceKind::Book
+            && (r.publisher.is_some() || r.series.is_some() || !r.isbn.is_empty())
+        {
+            let mut details = Vec::new();
+            if let Some(publisher) = &r.publisher {
+                details.push(publisher.clone());
+            }
+            if let Some(series) = &r.series {
+                details.push(series.clone());
+            }
+            if !r.isbn.is_empty() {
+                details.push(format!("ISBN {}", r.isbn.join(", ")));
+            }
+            lines.push(Line::from(Span::styled(details.join(" · "), s_dim)));
             lines.push(Line::from(""));
         }
 
@@ -3435,12 +3624,17 @@ impl DedupEntry {
             .to_string_lossy()
             .to_string();
         let reference = metadata::read_info(path).unwrap_or_else(|_| Reference {
+            kind: crate::model::ReferenceKind::Paper,
             title: "Unknown".to_string(),
             authors: vec![],
             year: None,
             doi: None,
             arxiv: None,
             journal: None,
+            edition: None,
+            publisher: None,
+            series: None,
+            isbn: vec![],
             tags: vec![],
             files: vec![],
             r#abstract: None,
@@ -3511,7 +3705,7 @@ fn draw_dedup(
         .map(|(i, e)| {
             let marker = if i == selected { "> " } else { "  " };
             let pdf_indicator = if e.has_pdf { " [PDF]" } else { "" };
-            let label = format!("{}{}{} ({}/9)", marker, e.dir_name, pdf_indicator, e.score);
+            let label = format!("{}{}{} ({}/13)", marker, e.dir_name, pdf_indicator, e.score);
             let style = if i == selected {
                 s_author.add_modifier(Modifier::BOLD)
             } else {
@@ -3610,8 +3804,9 @@ mod tests {
     use std::process::Command;
 
     use super::{
-        LayoutMode, picker_rect, prepare_reader_command, preview_authors, semantic_error_message,
-        semantic_heading_text, semantic_passage_lines, should_load_more_semantic,
+        LayoutMode, SemanticPassageBlock, formula_cell_size, picker_rect, prepare_reader_command,
+        preview_authors, semantic_error_message, semantic_heading_text, semantic_passage_blocks,
+        semantic_passage_lines, should_load_more_semantic,
     };
     use ratatui::layout::Rect;
 
@@ -3748,6 +3943,26 @@ mod tests {
                 "Second paragraph."
             ]
         );
+    }
+
+    #[test]
+    fn semantic_passage_preserves_display_formula_boundaries() {
+        assert_eq!(
+            semantic_passage_blocks("Before\n\n\\[\na_n \\to L\n\\]\n\nAfter", &[],),
+            [
+                SemanticPassageBlock::Text("Before".to_string()),
+                SemanticPassageBlock::Text(String::new()),
+                SemanticPassageBlock::Formula("a_n \\to L".to_string()),
+                SemanticPassageBlock::Text(String::new()),
+                SemanticPassageBlock::Text("After".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn formula_preview_preserves_aspect_ratio_when_constrained() {
+        assert_eq!(formula_cell_size(800, 160, 10, 20, 40, 12), (40, 4));
+        assert_eq!(formula_cell_size(200, 800, 10, 20, 40, 12), (6, 12));
     }
 
     #[test]

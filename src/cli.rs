@@ -106,13 +106,17 @@ pub fn list(
         let matches_query = query.is_none_or(|query| {
             let query = query.to_lowercase();
             let searchable = format!(
-                "{} {} {} {} {} {}",
+                "{} {} {} {} {} {} {} {} {} {}",
                 record.key,
                 record.reference.title,
                 record.reference.authors.join(" "),
                 record.reference.tags.join(" "),
                 record.reference.doi.as_deref().unwrap_or_default(),
                 record.reference.arxiv.as_deref().unwrap_or_default(),
+                record.reference.publisher.as_deref().unwrap_or_default(),
+                record.reference.series.as_deref().unwrap_or_default(),
+                record.reference.edition.as_deref().unwrap_or_default(),
+                record.reference.isbn.join(" "),
             )
             .to_lowercase();
             searchable.contains(&query)
