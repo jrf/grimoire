@@ -3185,6 +3185,22 @@ fn semantic_passage_lines<'a>(text: &'a str, headings: &[String]) -> Vec<&'a str
     lines[start..].to_vec()
 }
 
+fn preview_authors(authors: &[String]) -> String {
+    const LEADING_AUTHORS: usize = 2;
+
+    if authors.len() <= LEADING_AUTHORS + 1 {
+        return authors.join(" · ");
+    }
+
+    let hidden = authors.len() - LEADING_AUTHORS - 1;
+    let suffix = if hidden == 1 { "author" } else { "authors" };
+    format!(
+        "{} · {} · +{hidden} {suffix}",
+        authors[..LEADING_AUTHORS].join(" · "),
+        authors.last().expect("author list is non-empty")
+    )
+}
+
 fn draw_preview(f: &mut Frame, app: &App, area: ratatui::layout::Rect, s: &Styles) {
     let s_text = s.text;
     let s_dim = s.dim;
@@ -3222,7 +3238,7 @@ fn draw_preview(f: &mut Frame, app: &App, area: ratatui::layout::Rect, s: &Style
         lines.push(Line::from(""));
 
         if !r.authors.is_empty() {
-            let author_text = r.authors.join(" · ");
+            let author_text = preview_authors(&r.authors);
             lines.push(Line::from(Span::styled(author_text, s_author)));
             lines.push(Line::from(""));
         }
@@ -3533,7 +3549,10 @@ fn draw_dedup(
     lines.push(Line::default());
 
     if !r.authors.is_empty() {
-        lines.push(Line::from(Span::styled(r.authors.join(" · "), s_author)));
+        lines.push(Line::from(Span::styled(
+            preview_authors(&r.authors),
+            s_author,
+        )));
     }
     if let Some(year) = r.year {
         lines.push(Line::from(Span::styled(format!("{}", year), s_dim)));
@@ -3591,7 +3610,7 @@ mod tests {
     use std::process::Command;
 
     use super::{
-        LayoutMode, picker_rect, prepare_reader_command, semantic_error_message,
+        LayoutMode, picker_rect, prepare_reader_command, preview_authors, semantic_error_message,
         semantic_heading_text, semantic_passage_lines, should_load_more_semantic,
     };
     use ratatui::layout::Rect;
@@ -3601,6 +3620,29 @@ mod tests {
         let area = Rect::new(0, 0, 100, 40);
 
         assert_eq!(picker_rect(area), Rect::new(12, 5, 75, 30));
+    }
+
+    #[test]
+    fn preview_authors_shows_up_to_three_names() {
+        let authors = ["Ada", "Emmy", "Sofia"].map(str::to_string).to_vec();
+
+        assert_eq!(preview_authors(&authors), "Ada · Emmy · Sofia");
+    }
+
+    #[test]
+    fn preview_authors_summarizes_middle_names_and_shows_last_author() {
+        let four = ["Ada", "Emmy", "Sofia", "Maryam"]
+            .map(str::to_string)
+            .to_vec();
+        let five = ["Ada", "Emmy", "Sofia", "Maryam", "Katherine"]
+            .map(str::to_string)
+            .to_vec();
+
+        assert_eq!(preview_authors(&four), "Ada · Emmy · Maryam · +1 author");
+        assert_eq!(
+            preview_authors(&five),
+            "Ada · Emmy · Katherine · +2 authors"
+        );
     }
 
     #[test]
