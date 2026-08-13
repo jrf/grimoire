@@ -10,7 +10,7 @@ release:
     cargo build --release
 
 run *args:
-    cargo run -- {{args}}
+    cargo run -- {{ args }}
 
 check:
     cargo clippy
@@ -25,7 +25,7 @@ fmt:
 clean:
     cargo clean
 
-install: release
-    @cp target/release/grimoire ~/.local/bin/grimoire
-    @if [ "$(uname)" = "Darwin" ]; then codesign -s - ~/.local/bin/grimoire; fi
-    @echo "Installed → ~/.local/bin/grimoire"
+install:
+    cargo install --path . --locked --force
+    @if [ "$(uname)" = "Darwin" ]; then codesign -s - ~/.cargo/bin/grimoire; fi
+    @echo "Installed → ~/.cargo/bin/grimoire"
