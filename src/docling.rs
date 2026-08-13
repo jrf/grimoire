@@ -1,8 +1,10 @@
 use std::collections::HashSet;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
+use regex::{Captures, Regex};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -229,6 +231,11 @@ fn collect_blocks(
             .map(str::trim)
             .unwrap_or_default();
         if !text.is_empty() {
+            let text = if label == "formula" {
+                text.to_string()
+            } else {
+                normalize_inline_math(text)
+            };
             let page = item
                 .pointer("/prov/0/page_no")
                 .and_then(Value::as_u64)
@@ -239,7 +246,7 @@ fn collect_blocks(
                 .and_then(|level| usize::try_from(level).ok());
             blocks.push(Block {
                 label: label.to_string(),
-                text: text.to_string(),
+                text,
                 page,
                 level,
             });
@@ -255,6 +262,129 @@ fn collect_blocks(
         }
     }
     Ok(())
+}
+
+pub(crate) fn normalize_inline_math(text: &str) -> String {
+    static ABSOLUTE_VALUE: OnceLock<Regex> = OnceLock::new();
+    static OPEN_DELIMITER: OnceLock<Regex> = OnceLock::new();
+    static CLOSE_DELIMITER: OnceLock<Regex> = OnceLock::new();
+    static SPACED_PUNCTUATION: OnceLock<Regex> = OnceLock::new();
+    static SPACED_COMMA: OnceLock<Regex> = OnceLock::new();
+    static NUMBER_SET: OnceLock<Regex> = OnceLock::new();
+
+    let text = normalize_indexed_symbols(text);
+    let absolute_value = ABSOLUTE_VALUE.get_or_init(|| {
+        Regex::new(r"\|\s*([^|\n]+?)\s*\|").expect("absolute value regex is valid")
+    });
+    let open_delimiter = OPEN_DELIMITER
+        .get_or_init(|| Regex::new(r"([\(\[\{])\s+").expect("opening delimiter regex is valid"));
+    let close_delimiter = CLOSE_DELIMITER
+        .get_or_init(|| Regex::new(r"\s+([\)\]\}])").expect("closing delimiter regex is valid"));
+    let spaced_punctuation = SPACED_PUNCTUATION
+        .get_or_init(|| Regex::new(r"\s+([,.;:])").expect("spaced punctuation regex is valid"));
+    let spaced_comma = SPACED_COMMA
+        .get_or_init(|| Regex::new(r",\s*([[:alpha:]\-+])").expect("comma spacing regex is valid"));
+    let number_set =
+        NUMBER_SET.get_or_init(|| Regex::new(r"\b([NQRZ])\b").expect("number set regex is valid"));
+
+    let text = absolute_value.replace_all(&text, |captures: &Captures<'_>| {
+        format!("|{}|", captures[1].trim())
+    });
+    let text = open_delimiter.replace_all(&text, "$1");
+    let text = close_delimiter.replace_all(&text, "$1");
+    let text = spaced_punctuation.replace_all(&text, "$1");
+    let text = spaced_comma.replace_all(&text, ", $1");
+    number_set
+        .replace_all(&text, |captures: &Captures<'_>| match &captures[1] {
+            "N" => "ℕ",
+            "Q" => "ℚ",
+            "R" => "ℝ",
+            "Z" => "ℤ",
+            _ => unreachable!("number-set regex limits captures"),
+        })
+        .into_owned()
+}
+
+fn normalize_indexed_symbols(text: &str) -> String {
+    static INDEXED_SYMBOL: OnceLock<Regex> = OnceLock::new();
+    let indexed_symbol = INDEXED_SYMBOL.get_or_init(|| {
+        Regex::new(r"\b[A-Za-z](?:\s+(?:[0-9]+|[aehijklmnoprstuvx])\b)+(?:\s*-\s*[0-9]+)?")
+            .expect("indexed symbol regex is valid")
+    });
+
+    let mut normalized = String::with_capacity(text.len());
+    let mut end = 0;
+    for found in indexed_symbol.find_iter(text) {
+        normalized.push_str(&text[end..found.start()]);
+        let candidate = found.as_str();
+        let compact = candidate
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect::<String>();
+        let mut chars = compact.chars();
+        let base = chars.next().expect("indexed symbol always has a base");
+        let suffix = chars.collect::<String>();
+        let roman_enumeration = matches!(base, 'i' | 'v' | 'x')
+            && suffix.chars().all(|ch| matches!(ch, 'i' | 'v' | 'x'))
+            && surrounded_by_parentheses(text, found.start(), found.end());
+        let ambiguous_difference = suffix
+            .split_once('-')
+            .is_some_and(|(before, _)| before.chars().all(|ch| ch.is_ascii_digit()));
+
+        if roman_enumeration || ambiguous_difference {
+            normalized.push_str(candidate);
+        } else if let Some(suffix) = subscript_token(&suffix) {
+            normalized.push(base);
+            normalized.push_str(&suffix);
+        } else {
+            normalized.push_str(candidate);
+        }
+        end = found.end();
+    }
+    normalized.push_str(&text[end..]);
+    normalized
+}
+
+fn surrounded_by_parentheses(text: &str, start: usize, end: usize) -> bool {
+    text[..start].trim_end().ends_with('(') && text[end..].trim_start().starts_with(')')
+}
+
+fn subscript_token(token: &str) -> Option<String> {
+    token.chars().map(subscript_char).collect()
+}
+
+fn subscript_char(character: char) -> Option<char> {
+    match character {
+        '0' => Some('₀'),
+        '1' => Some('₁'),
+        '2' => Some('₂'),
+        '3' => Some('₃'),
+        '4' => Some('₄'),
+        '5' => Some('₅'),
+        '6' => Some('₆'),
+        '7' => Some('₇'),
+        '8' => Some('₈'),
+        '9' => Some('₉'),
+        'a' => Some('ₐ'),
+        'e' => Some('ₑ'),
+        'h' => Some('ₕ'),
+        'i' => Some('ᵢ'),
+        'j' => Some('ⱼ'),
+        'k' => Some('ₖ'),
+        'l' => Some('ₗ'),
+        'm' => Some('ₘ'),
+        'n' => Some('ₙ'),
+        'o' => Some('ₒ'),
+        'p' => Some('ₚ'),
+        'r' => Some('ᵣ'),
+        's' => Some('ₛ'),
+        't' => Some('ₜ'),
+        'u' => Some('ᵤ'),
+        'v' => Some('ᵥ'),
+        'x' => Some('ₓ'),
+        '-' => Some('₋'),
+        _ => None,
+    }
 }
 
 fn build_passages(blocks: &[Block]) -> Vec<Passage> {
@@ -322,7 +452,7 @@ fn atomic_write_jsonl(path: &Path, passages: &[Passage]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::import;
+    use super::{import, normalize_inline_math};
     use serde_json::json;
 
     #[test]
@@ -386,5 +516,43 @@ mod tests {
                 .contains("\\[\na_n \\to L\n\\]")
         );
         assert!(!passage["text"].as_str().unwrap().contains("\n\nM\n\n"));
+    }
+
+    #[test]
+    fn normalizes_common_docling_inline_math_without_rewriting_prose() {
+        assert_eq!(
+            normalize_inline_math(
+                "If ( a n ) lies in [ c, d ], then ( a n k ) converges; keep ( f g ) and ( i i )."
+            ),
+            "If (aₙ) lies in [c, d], then (aₙₖ) converges; keep (f g) and (i i)."
+        );
+    }
+
+    #[test]
+    fn normalizes_inline_indices_absolute_values_sets_and_intervals() {
+        assert_eq!(
+            normalize_inline_math(
+                "Proof. Let ( a n ) satisfy | a n | ≤ M for n ∈ N . Use [ -M,M ], I 1 , a n 1 ∈ I 1 , and I k -1."
+            ),
+            "Proof. Let (aₙ) satisfy |aₙ| ≤ M for n ∈ ℕ. Use [-M, M], I₁, aₙ₁ ∈ I₁, and Iₖ₋₁."
+        );
+    }
+
+    #[test]
+    fn normalizes_bolzano_weierstrass_proof_inline_math() {
+        assert_eq!(
+            normalize_inline_math(
+                "Proof. Let ( a n ) be bounded with | a n | ≤ M for all n ∈ N . Bisect [ -M,M ] into [ -M, 0] and [0 , M ]. Label the interval I 1 . Then a n 1 ∈ I 1 ."
+            ),
+            "Proof. Let (aₙ) be bounded with |aₙ| ≤ M for all n ∈ ℕ. Bisect [-M, M] into [-M, 0] and [0, M]. Label the interval I₁. Then aₙ₁ ∈ I₁."
+        );
+    }
+
+    #[test]
+    fn leaves_ambiguous_powers_and_enumerations_alone() {
+        assert_eq!(
+            normalize_inline_math("Keep ( i v ), 1-1, and x 2 -1 unchanged."),
+            "Keep (i v), 1-1, and x 2 -1 unchanged."
+        );
     }
 }
