@@ -293,9 +293,14 @@ score meaningful while helping with theorem names and LaTeX command names.
 `grimoire import-derived <key> --docling <document.json>` preserves the source
 Docling JSON and creates `derived/docling/passages.jsonl`. Page furniture is
 discarded; headings, page numbers, prose, lists, code, and normalized LaTeX
-formula blocks are retained. Picture-internal OCR (individual diagram labels,
-ticks, and glyphs) is excluded from prose passages. The PDF remains the source
-of truth. The importer does not copy Docling page-render PNGs.
+formula blocks are retained. Common spaced inline notation from Docling is
+normalized for terminal readability, such as `( a n )` to `(aₙ)` and
+`[ c, d ]` to `[c, d]`; this also covers indexed variables, absolute values,
+number sets, and punctuation around inline expressions. The TUI applies the
+same cleanup to existing semantic passages, so reindexing is unnecessary.
+Picture-internal OCR (individual diagram labels, ticks, and glyphs) is excluded
+from prose passages. The PDF remains the source of truth. The importer does not
+copy Docling page-render PNGs.
 
 In Kitty, semantic passage previews use Docling's page provenance to crop
 formulae from the source PDF and render the original typesetting. This avoids

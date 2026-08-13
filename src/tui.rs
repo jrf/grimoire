@@ -19,6 +19,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::{Frame, Terminal};
 
 use crate::config::Config as AppConfig;
+use crate::docling::normalize_inline_math;
 use crate::formula::{FormulaOverlay, FormulaRenderer, ResolvedFormula};
 use crate::index;
 use crate::metadata;
@@ -2574,7 +2575,9 @@ fn draw(f: &mut Frame, app: &mut App) {
                                     location
                                 )
                             };
-                            let compact = hit.text.split_whitespace().collect::<Vec<_>>().join(" ");
+                            let compact = normalize_inline_math(
+                                &hit.text.split_whitespace().collect::<Vec<_>>().join(" "),
+                            );
                             let mut lines = semantic_ranked_title_lines(
                                 rank,
                                 paper.similarity,
@@ -2619,7 +2622,9 @@ fn draw(f: &mut Frame, app: &mut App) {
                             } else {
                                 format!("  {}", semantic_heading_text(&hit.headings))
                             };
-                            let compact = hit.text.split_whitespace().collect::<Vec<_>>().join(" ");
+                            let compact = normalize_inline_math(
+                                &hit.text.split_whitespace().collect::<Vec<_>>().join(" "),
+                            );
                             let title = if location.is_empty() {
                                 hit.paper_title.clone()
                             } else {
@@ -3295,7 +3300,7 @@ fn semantic_passage_blocks(text: &str, headings: &[String]) -> Vec<SemanticPassa
                 formula = None;
             }
             (_, Some(lines)) => lines.push(line),
-            _ => blocks.push(SemanticPassageBlock::Text(line.to_string())),
+            _ => blocks.push(SemanticPassageBlock::Text(normalize_inline_math(line))),
         }
     }
     if let Some(lines) = formula {
@@ -4025,6 +4030,16 @@ mod tests {
                 SemanticPassageBlock::Text(String::new()),
                 SemanticPassageBlock::Text("After".to_string()),
             ]
+        );
+    }
+
+    #[test]
+    fn semantic_passage_normalizes_docling_inline_math() {
+        assert_eq!(
+            semantic_passage_blocks("If ( a n ) lies in [ c, d ].", &[]),
+            [SemanticPassageBlock::Text(
+                "If (aₙ) lies in [c, d].".to_string()
+            )]
         );
     }
 
