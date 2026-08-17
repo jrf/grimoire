@@ -231,8 +231,36 @@ fn titles_match(a: &str, b: &str) -> bool {
 }
 
 pub fn fetch_crossref(doi: &str) -> Result<Reference> {
-    let body = fetch_crossref_body(doi)?;
-    parse_crossref_response(&body)
+    match fetch_crossref_body(doi) {
+        Ok(body) => parse_crossref_response(&body),
+        // Not every DOI is registered with CrossRef — datasets and software
+        // (e.g. Zenodo `10.5281/...`) are registered with DataCite. Fall back
+        // to DOI content negotiation, which returns CSL-JSON for any agency.
+        Err(crossref_err) => fetch_doi_csl(doi).with_context(|| {
+            format!("CrossRef lookup failed ({crossref_err}) and DOI content negotiation fallback")
+        }),
+    }
+}
+
+/// Fetch CSL-JSON for a DOI via doi.org content negotiation. This resolves to
+/// whichever registration agency owns the DOI (CrossRef, DataCite, mEDRA, …),
+/// so it works for Zenodo/DataCite records that CrossRef's API doesn't know.
+fn fetch_doi_csl(doi: &str) -> Result<Reference> {
+    let url = format!("https://doi.org/{}", doi);
+    let body = http_client()?
+        .get(&url)
+        .header(
+            reqwest::header::ACCEPT,
+            "application/vnd.citationstyles.csl+json",
+        )
+        .send()
+        .context("Failed to reach doi.org for content negotiation")?
+        .error_for_status()
+        .context("doi.org content negotiation returned an error")?
+        .text()?;
+    let v: serde_json::Value =
+        serde_json::from_str(&body).context("Invalid CSL-JSON from doi.org")?;
+    Ok(parse_csl_item(&v))
 }
 
 pub fn fetch_pmc(pmc_id: &str) -> Result<(Reference, Vec<u8>)> {

@@ -983,7 +983,7 @@ fn add_from_doi_with_pdf(
     pdf_url: Option<&str>,
     force: bool,
 ) -> Result<()> {
-    eprintln!("Fetching metadata from CrossRef: {}", doi);
+    eprintln!("Fetching metadata for DOI: {}", doi);
     let reference = fetch::fetch_crossref(doi)?;
     add_reference_with_pdf(library, reference, pdf_url, force)
 }
