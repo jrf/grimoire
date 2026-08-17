@@ -25,10 +25,16 @@ Grimoire's embedding stack (`fastembed` → `ort` → `ort-sys`) bundles prebuil
 ONNX Runtime C++ objects built with a modern GCC. On hosts whose system
 `libstdc++` predates GCC 12, the final link fails with
 `rust-lld: error: undefined symbol: std::...`. To avoid depending on the host's
-C++ runtime, `.cargo/config.toml` statically links libstdc++/libgcc on Linux GNU
-targets. Build on a machine that already has GCC ≥ 12 (for example a
-`manylinux_2_28` container), then copy the self-contained binary to the older
-hosts — `ldd` on the result should not list `libstdc++.so`.
+C++ runtime, statically link libstdc++/libgcc:
+
+```sh
+RUSTFLAGS="-C link-args=-static-libstdc++ -C link-args=-static-libgcc" \
+  cargo install --path . --locked --force
+```
+
+Build on a machine that already has GCC ≥ 12 (for example a `manylinux_2_28`
+container), then copy the self-contained binary to the older hosts — `ldd` on
+the result should not list `libstdc++.so`.
 
 ## Development
 
