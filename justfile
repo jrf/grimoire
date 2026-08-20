@@ -25,6 +25,9 @@ fmt:
 clean:
     cargo clean
 
+build-extension:
+    ./scripts/build-extension
+
 install:
     cargo install --path . --locked --force
     @if [ "$(uname)" = "Darwin" ]; then codesign -s - ~/.cargo/bin/grimoire; fi
