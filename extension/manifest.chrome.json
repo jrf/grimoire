@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "Grimoire",
+  "version": "0.1.0",
+  "description": "Send the current paper (arXiv, DOI, PubMed, or PDF URL) to your local Grimoire library.",
+  "icons": {
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Add to Grimoire",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "48": "icons/icon-48.png",
+      "128": "icons/icon-128.png"
+    }
+  },
+  "permissions": ["activeTab", "nativeMessaging", "contextMenus", "notifications"],
+  "commands": {
+    "add-current-tab": {
+      "suggested_key": { "default": "Ctrl+Shift+G", "mac": "Command+Shift+G" },
+      "description": "Add the current tab to Grimoire"
+    }
+  }
+}

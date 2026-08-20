@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Assemble per-browser extension bundles from the shared source in extension/.
+#
+# Chrome/Edge/Brave and Firefox load the same JS/HTML but need different
+# top-level manifests (service_worker vs scripts, gecko id, etc.). This copies
+# the shared files plus the matching manifest.json into dist/<browser>/.
+#
+# Safari: run `just safari-extension` (below) — Xcode's converter wraps the
+# Chrome bundle into an app that hosts the WebExtension.
+set -euo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+src="$root/extension"
+dist="$root/dist"
+
+shared=(background.js popup.html popup.js icons)
+
+build() {
+  local browser="$1" manifest="$2"
+  local out="$dist/$browser"
+  rm -rf "$out"
+  mkdir -p "$out"
+  for item in "${shared[@]}"; do
+    cp -R "$src/$item" "$out/"
+  done
+  cp "$src/$manifest" "$out/manifest.json"
+  echo "built $out"
+}
+
+build chrome  manifest.chrome.json
+build firefox manifest.firefox.json
+
+echo
+echo "Load unpacked:"
+echo "  Chrome/Edge/Brave: chrome://extensions → Developer mode → Load unpacked → $dist/chrome"
+echo "  Firefox:           about:debugging → This Firefox → Load Temporary Add-on → $dist/firefox/manifest.json"
+echo
+echo "Safari (macOS, needs Xcode):"
+echo "  xcrun safari-web-extension-converter $dist/chrome --project-location $dist/safari"

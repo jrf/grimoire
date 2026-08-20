@@ -1,4 +1,5 @@
 mod backfill;
+mod browser_host;
 mod cli;
 mod config;
 mod dedup;
@@ -248,6 +249,19 @@ enum Command {
     Completions {
         /// Shell to generate completions for
         shell: clap_complete::Shell,
+    },
+    /// Run the browser native-messaging host (launched by the browser, not by hand)
+    BrowserHost,
+    /// Install native-messaging manifests so browser extensions can reach grimoire
+    InstallBrowserHost {
+        /// Extension IDs allowed to connect (repeatable; Chrome/Edge use these
+        /// as `allowed_origins`, Firefox uses them as `allowed_extensions`)
+        #[arg(long = "extension-id")]
+        extension_ids: Vec<String>,
+        /// Absolute path to the grimoire binary to launch (defaults to the
+        /// current executable)
+        #[arg(long)]
+        binary: Option<PathBuf>,
     },
 }
 
@@ -686,6 +700,37 @@ fn run(cli: Cli) -> Result<()> {
             clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
             Ok(())
         }
+        Some(Command::BrowserHost) => {
+            anyhow::ensure!(!cli.json, "--json is not valid for the browser host");
+            browser_host::run(&config)
+        }
+        Some(Command::InstallBrowserHost {
+            extension_ids,
+            binary,
+        }) => {
+            let binary = match binary {
+                Some(path) => path,
+                None => std::env::current_exe()
+                    .context("Failed to determine the current grimoire executable path")?,
+            };
+            let installed = browser_host::install_manifests(&binary, &extension_ids)?;
+            if cli.json {
+                cli::print_json(serde_json::json!({
+                    "binary": binary,
+                    "manifests": installed,
+                }))
+            } else {
+                if installed.is_empty() {
+                    println!("No supported browser manifest directories found for this platform.");
+                } else {
+                    println!("Installed native-messaging manifests:");
+                    for path in &installed {
+                        println!("  → {}", path.display());
+                    }
+                }
+                Ok(())
+            }
+        }
     }
 }
 
@@ -803,17 +848,8 @@ pub fn cmd_add_many(
     let mut failures = 0;
     let mut results = Vec::new();
     for input in inputs {
-        let before = storage::list_ref_dirs(library)?;
-        match cmd_add(library, input, force, options) {
-            Ok(()) => {
-                let after = storage::list_ref_dirs(library)?;
-                let mut keys = after
-                    .iter()
-                    .filter(|path| !before.contains(path))
-                    .filter_map(|path| path.file_name())
-                    .map(|name| name.to_string_lossy().to_string())
-                    .collect::<Vec<_>>();
-                keys.sort();
+        match cmd_add_capture(library, input, force, options) {
+            Ok(keys) => {
                 results.push(AddResult {
                     input: input.clone(),
                     status: if keys.is_empty() { "skipped" } else { "added" },
@@ -830,6 +866,29 @@ pub fn cmd_add_many(
         anyhow::bail!("{failures} of {} input(s) failed", inputs.len());
     }
     Ok(AddReport { inputs: results })
+}
+
+/// Import a single input and return the library keys it created (empty when the
+/// reference already existed and was skipped). Wraps [`cmd_add`] with the
+/// before/after directory diff so callers — the CLI batch importer and the
+/// browser native-messaging host — share one code path.
+pub fn cmd_add_capture(
+    library: &Path,
+    input: &str,
+    force: bool,
+    options: &AddOptions,
+) -> Result<Vec<String>> {
+    let before = storage::list_ref_dirs(library)?;
+    cmd_add(library, input, force, options)?;
+    let after = storage::list_ref_dirs(library)?;
+    let mut keys = after
+        .iter()
+        .filter(|path| !before.contains(path))
+        .filter_map(|path| path.file_name())
+        .map(|name| name.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    keys.sort();
+    Ok(keys)
 }
 
 pub fn cmd_add(library: &Path, input: &str, force: bool, options: &AddOptions) -> Result<()> {
