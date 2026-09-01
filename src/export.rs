@@ -151,6 +151,8 @@ struct HayagrivaEntry {
     parent: Option<HayagrivaParent>,
     #[serde(rename = "serial-number", skip_serializing_if = "Option::is_none")]
     serial_number: Option<HayagrivaSerial>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    url: Option<String>,
     #[serde(rename = "abstract", skip_serializing_if = "Option::is_none")]
     r#abstract: Option<String>,
 }
@@ -196,13 +198,20 @@ fn to_hayagriva(r: &Reference) -> HayagrivaEntry {
             title,
         }),
         serial_number: serial,
+        // Hayagriva's Chicago styles link DOI serial numbers, but do not render
+        // arXiv serial numbers as links. Give arXiv-only works an explicit URL.
+        url: r
+            .arxiv
+            .as_ref()
+            .filter(|_| r.doi.is_none())
+            .map(|id| format!("https://arxiv.org/abs/{id}")),
         r#abstract: r.r#abstract.clone(),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::to_bibtex;
+    use super::{to_bibtex, to_hayagriva};
     use crate::model::Reference;
 
     #[test]
@@ -226,5 +235,21 @@ mod tests {
         assert!(bibtex.contains("publisher = {Example Press}"));
         assert!(bibtex.contains("edition = {2}"));
         assert!(bibtex.contains("isbn = {978-0-00-000000-0}"));
+    }
+
+    #[test]
+    fn exports_arxiv_only_hayagriva_entries_with_links() {
+        let reference: Reference = toml::from_str(
+            r#"
+            title = "Synthetic preprint"
+            authors = ["Ada Example"]
+            year = 2026
+            arxiv = "2601.01234v2"
+            "#,
+        )
+        .unwrap();
+
+        let yaml = serde_norway::to_string(&to_hayagriva(&reference)).unwrap();
+        assert!(yaml.contains("url: https://arxiv.org/abs/2601.01234v2"));
     }
 }

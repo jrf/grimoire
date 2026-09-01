@@ -122,13 +122,80 @@ fn make_dir_name(reference: &Reference) -> String {
     slugify(format!("{}-{}-{}", author, year, title_word))
 }
 
+/// True for a single-letter name token such as `M.`, `O.` or `R`, which is an
+/// initial rather than a surname.
+fn is_initial(token: &str) -> bool {
+    let token = token.trim_end_matches('.');
+    token.chars().count() == 1 && token.chars().all(char::is_alphabetic)
+}
+
 fn last_name(author: &str) -> String {
     if let Some((last, _)) = author.rsplit_once(',') {
         return last.trim().to_string();
     }
-    author
-        .split_whitespace()
-        .last()
-        .unwrap_or(author)
-        .to_string()
+
+    let tokens: Vec<&str> = author.split_whitespace().collect();
+    let Some(last_token) = tokens.last() else {
+        return author.to_string();
+    };
+
+    // A trailing initial means the name is stored surname-first with the comma
+    // missing ("Wahba George M."). Taking the last token would key the entry on
+    // the initial, so fall back to the first non-initial token instead.
+    if tokens.len() > 1
+        && is_initial(last_token)
+        && let Some(surname) = tokens.iter().find(|t| !is_initial(t))
+    {
+        return (*surname).to_string();
+    }
+
+    (*last_token).to_string()
+}
+
+#[cfg(test)]
+mod last_name_tests {
+    use super::last_name;
+
+    #[test]
+    fn comma_form_uses_the_text_before_the_comma() {
+        assert_eq!(last_name("Bardes, Adrien"), "Bardes");
+        assert_eq!(last_name("Vinsard, Daniela Guerrero"), "Vinsard");
+        assert_eq!(last_name("Polat, Gorkem"), "Polat");
+    }
+
+    #[test]
+    fn plain_form_uses_the_final_token() {
+        assert_eq!(last_name("Kaiming He"), "He");
+        assert_eq!(last_name("Sarah Bencardino"), "Bencardino");
+        assert_eq!(last_name("Lorenzo Mur-Labadia"), "Mur-Labadia");
+    }
+
+    /// Comma-less inverted names used to key on the trailing initial, which
+    /// produced library directories such as `m-2025-use` and
+    /// `r-2025-foundation`.
+    #[test]
+    fn trailing_initial_does_not_become_the_surname() {
+        assert_eq!(last_name("Wahba George M."), "Wahba");
+        assert_eq!(last_name("Prichard David O."), "Prichard");
+        assert_eq!(last_name("Phillips Hayley R."), "Phillips");
+        assert_eq!(last_name("Fetzer Jeffrey R."), "Fetzer");
+    }
+
+    #[test]
+    fn leading_initials_still_resolve_to_the_final_surname() {
+        assert_eq!(last_name("George M. Wahba"), "Wahba");
+        assert_eq!(last_name("G. Žibret"), "Žibret");
+        assert_eq!(last_name("Luisa F. Sánchez-Peralta"), "Sánchez-Peralta");
+    }
+
+    #[test]
+    fn diacritics_are_preserved_for_the_slugifier_to_transliterate() {
+        assert_eq!(last_name("Jorge Sánchez"), "Sánchez");
+    }
+
+    #[test]
+    fn single_token_and_empty_names_are_returned_unchanged() {
+        assert_eq!(last_name("DeepSeek-AI"), "DeepSeek-AI");
+        assert_eq!(last_name(""), "");
+    }
 }
