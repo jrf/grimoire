@@ -1438,10 +1438,8 @@ fn decode_embedding(bytes: &[u8]) -> Result<Vec<f32>> {
         bytes.len().is_multiple_of(std::mem::size_of::<f32>()),
         "Stored embedding has an invalid byte length"
     );
-    Ok(bytes
-        .chunks_exact(std::mem::size_of::<f32>())
-        .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
-        .collect())
+    let (chunks, _) = bytes.as_chunks::<{ std::mem::size_of::<f32>() }>();
+    Ok(chunks.iter().copied().map(f32::from_le_bytes).collect())
 }
 
 fn cosine_similarity(left: &[f32], right: &[f32]) -> Result<f32> {
