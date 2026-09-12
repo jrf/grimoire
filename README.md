@@ -283,6 +283,23 @@ If an incoming reference matches an existing entry by DOI or normalized title,
 deduplicator (`d` in the TUI) groups existing references that share a title
 **or** DOI so you can merge them after the fact.
 
+## Browser extension
+
+Add the paper you're viewing to your library from **Chrome, Edge, Brave,
+Vivaldi, Firefox, or Safari** — one click or ⌘⇧G / Ctrl+Shift+G. The extension
+sends the current tab (arXiv, DOI, PubMed, publisher page, or PDF link) to the
+same smart importer above. Nothing leaves your machine: it talks to a local
+`grimoire browser-host` process via the browser's native-messaging protocol.
+
+```sh
+just build-extension                          # writes dist/chrome and dist/firefox
+# load dist/chrome (or dist/firefox) as an unpacked extension, then:
+grimoire install-browser-host --extension-id <extension-id>
+```
+
+Full setup, Safari packaging, and troubleshooting are in
+[`extension/README.md`](extension/README.md).
+
 ## Semantic search
 
 `grimoire semantic-index` recursively reads `*.jsonl` files below each work's

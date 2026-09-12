@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Grimoire</title>
+    <style>
+      :root { color-scheme: light dark; }
+      body {
+        font: 13px/1.4 -apple-system, system-ui, sans-serif;
+        margin: 0;
+        padding: 12px;
+        width: 260px;
+      }
+      h1 { font-size: 14px; margin: 0 0 8px; }
+      .url {
+        font-size: 11px;
+        opacity: 0.7;
+        word-break: break-all;
+        margin-bottom: 10px;
+        max-height: 3.6em;
+        overflow: hidden;
+      }
+      button {
+        width: 100%;
+        padding: 8px;
+        font-size: 13px;
+        border: 0;
+        border-radius: 6px;
+        background: #5b4bff;
+        color: #fff;
+        cursor: pointer;
+      }
+      button:disabled { opacity: 0.6; cursor: default; }
+      label { display: block; margin: 8px 0; font-size: 12px; }
+      .status { margin-top: 10px; font-size: 12px; min-height: 1.4em; }
+      .status.ok { color: #2e7d32; }
+      .status.err { color: #c62828; }
+    </style>
+  </head>
+  <body>
+    <h1>Add to Grimoire</h1>
+    <div class="url" id="url">…</div>
+    <button id="add">Add this page</button>
+    <label><input type="checkbox" id="force" /> Import even if it already exists</label>
+    <div class="status" id="status"></div>
+    <script src="popup.js"></script>
+  </body>
+</html>
